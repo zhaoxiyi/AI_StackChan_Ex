@@ -1,0 +1,115 @@
+2026-07-30 12:41:06.543 | INFO     | system       | 日志系统初始化完成
+2026-07-30 12:41:06.543 | INFO     | system       | 正在启动 uvicorn...
+2026-07-30 12:41:06.558 | INFO     | system       | ============================================================
+2026-07-30 12:41:06.558 | INFO     | system       | StackChan Server 启动中...
+2026-07-30 12:41:06.558 | INFO     | system       | ============================================================
+2026-07-30 12:41:06.558 | INFO     | system       | 监听地址: 0.0.0.0:8080
+2026-07-30 12:41:06.559 | INFO     | system       | WebSocket 端点: ws://0.0.0.0:8080/v1/realtime
+2026-07-30 12:41:06.559 | INFO     | system       | 健康检查: http://0.0.0.0:8080/health
+2026-07-30 12:41:06.559 | INFO     | system       | 本地 vLLM: Qwen/Qwen2.5-7B-Instruct @ http://localhost:8000/v1
+2026-07-30 12:41:06.559 | INFO     | system       | DeepSeek Cloud: deepseek-chat
+2026-07-30 12:41:06.559 | INFO     | system       | STT 引擎: faster_whisper
+2026-07-30 12:41:06.559 | INFO     | system       | TTS 引擎: openai_tts
+2026-07-30 12:41:06.559 | INFO     | system       | 中断策略: immediate_stop
+2026-07-30 12:41:06.559 | INFO     | system       | ============================================================
+2026-07-30 12:41:06.561 | INFO     | system       | StackChan Server 正在关闭...
+2026-07-30 12:41:26.920 | INFO     | system       | 日志系统初始化完成
+2026-07-30 12:41:26.920 | INFO     | system       | 正在启动 uvicorn...
+2026-07-30 12:41:26.935 | INFO     | system       | ============================================================
+2026-07-30 12:41:26.935 | INFO     | system       | StackChan Server 启动中...
+2026-07-30 12:41:26.936 | INFO     | system       | ============================================================
+2026-07-30 12:41:26.936 | INFO     | system       | 监听地址: 0.0.0.0:8080
+2026-07-30 12:41:26.936 | INFO     | system       | WebSocket 端点: ws://0.0.0.0:8080/v1/realtime
+2026-07-30 12:41:26.936 | INFO     | system       | 健康检查: http://0.0.0.0:8080/health
+2026-07-30 12:41:26.936 | INFO     | system       | 本地 vLLM: Qwen/Qwen2.5-7B-Instruct @ http://localhost:8000/v1
+2026-07-30 12:41:26.936 | INFO     | system       | DeepSeek Cloud: deepseek-chat
+2026-07-30 12:41:26.936 | INFO     | system       | STT 引擎: faster_whisper
+2026-07-30 12:41:26.936 | INFO     | system       | TTS 引擎: openai_tts
+2026-07-30 12:41:26.936 | INFO     | system       | 中断策略: immediate_stop
+2026-07-30 12:41:26.936 | INFO     | system       | ============================================================
+2026-07-30 12:42:58.570 | INFO     | system       | StackChan Server 正在关闭...
+2026-07-30 13:06:19.075 | INFO     | system       | stackchan_server.logging_config:setup_logging:72 | 日志系统初始化完成
+2026-07-30 13:06:19.075 | INFO     | system       | stackchan_server.main:lifespan:35 | StackChan Server v0.2.0 启动
+2026-07-30 13:06:19.075 | INFO     | system       | stackchan_server.main:lifespan:36 | WebSocket: ws://0.0.0.0:8080/v1/realtime
+2026-07-30 13:06:19.075 | INFO     | system       | stackchan_server.main:lifespan:37 | 健康检查: http://0.0.0.0:8080/health
+2026-07-30 13:06:19.075 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 vllm: Qwen/Qwen2.5-7B-Instruct @ http://localhost:8000/v1
+2026-07-30 13:06:19.075 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 deepseek: deepseek-chat @ https://api.deepseek.com/v1
+2026-07-30 13:10:03.629 | INFO     | system       | stackchan_server.logging_config:setup_logging:72 | 日志系统初始化完成
+2026-07-30 13:10:03.629 | INFO     | system       | stackchan_server.main:lifespan:35 | StackChan Server v0.2.0 启动
+2026-07-30 13:10:03.629 | INFO     | system       | stackchan_server.main:lifespan:36 | WebSocket: ws://0.0.0.0:8080/v1/realtime
+2026-07-30 13:10:03.629 | INFO     | system       | stackchan_server.main:lifespan:37 | 健康检查: http://0.0.0.0:8080/health
+2026-07-30 13:10:03.629 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 vllm: Qwen/Qwen2.5-7B-Instruct @ http://localhost:8000/v1
+2026-07-30 13:10:03.629 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 deepseek: deepseek-chat @ https://api.deepseek.com/v1
+2026-07-30 13:10:03.647 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:61 | 引擎 vllm 就绪
+2026-07-30 13:10:03.652 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:61 | 引擎 deepseek 就绪
+2026-07-30 13:10:03.652 | WARNING  | system       | stackchan_server.engines.stt.whisper_engine:start:36 | faster-whisper 未安装，STT 不可用。安装: pip install faster-whisper
+2026-07-30 13:10:03.652 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:79 | 引擎 stt 就绪
+2026-07-30 13:10:03.656 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:93 | 引擎 tts 就绪
+2026-07-30 13:18:07.912 | INFO     | system       | stackchan_server.logging_config:setup_logging:72 | 日志系统初始化完成
+2026-07-30 13:18:07.912 | INFO     | system       | stackchan_server.main:lifespan:35 | StackChan Server v0.2.0 启动
+2026-07-30 13:18:07.912 | INFO     | system       | stackchan_server.main:lifespan:36 | WebSocket: ws://0.0.0.0:8080/v1/realtime
+2026-07-30 13:18:07.912 | INFO     | system       | stackchan_server.main:lifespan:37 | 健康检查: http://0.0.0.0:8080/health
+2026-07-30 13:18:07.912 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 vllm: Qwen/Qwen2.5-7B-Instruct @ http://localhost:8000/v1
+2026-07-30 13:18:07.912 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 deepseek: deepseek-chat @ https://api.deepseek.com/v1
+2026-07-30 13:18:07.935 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:62 | LLM vllm (Qwen/Qwen2.5-7B-Instruct) 就绪
+2026-07-30 13:18:09.456 | WARNING  | system       | stackchan_server.engines.llm.llm_engine:check:110 | [DeepSeek] 余额查询失败: Illegal header value b'Bearer '
+2026-07-30 13:18:09.458 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:62 | LLM deepseek (deepseek-chat) 就绪
+2026-07-30 13:18:09.459 | WARNING  | system       | stackchan_server.engines.stt.stt_engine:start:92 | faster-whisper 未安装，STT 不可用。安装: pip install faster-whisper
+2026-07-30 13:18:09.459 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:80 | STT 就绪
+2026-07-30 13:18:09.459 | INFO     | system       | stackchan_server.engines.tts.tts_engine:start:81 | TTS 语音: alloy
+2026-07-30 13:18:09.459 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:92 | TTS 就绪
+2026-07-30 13:28:36.796 | INFO     | system       | stackchan_server.logging_config:setup_logging:72 | 日志系统初始化完成
+2026-07-30 13:28:36.796 | INFO     | system       | stackchan_server.main:lifespan:35 | StackChan Server v0.2.0 启动
+2026-07-30 13:28:36.796 | INFO     | system       | stackchan_server.main:lifespan:36 | WebSocket: ws://0.0.0.0:8080/v1/realtime
+2026-07-30 13:28:36.801 | INFO     | system       | stackchan_server.main:lifespan:37 | 健康检查: http://0.0.0.0:8080/health
+2026-07-30 13:28:36.801 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 vllm: Qwen/Qwen2.5-7B-Instruct @ http://localhost:8000/v1
+2026-07-30 13:28:36.802 | INFO     | system       | stackchan_server.main:lifespan:40 |   模型 deepseek: deepseek-chat @ https://api.deepseek.com/v1
+2026-07-30 13:28:36.825 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:62 | LLM vllm (Qwen/Qwen2.5-7B-Instruct) 就绪
+2026-07-30 13:28:39.312 | WARNING  | system       | stackchan_server.engines.llm.llm_engine:check:110 | [DeepSeek] 余额查询失败: Illegal header value b'Bearer '
+2026-07-30 13:28:39.314 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:62 | LLM deepseek (deepseek-chat) 就绪
+2026-07-30 13:28:39.315 | WARNING  | system       | stackchan_server.engines.stt.stt_engine:start:92 | faster-whisper 未安装，STT 不可用。安装: pip install faster-whisper
+2026-07-30 13:28:39.315 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:80 | STT 就绪
+2026-07-30 13:28:39.315 | INFO     | system       | stackchan_server.engines.tts.tts_engine:start:81 | TTS 语音: alloy
+2026-07-30 13:28:39.316 | INFO     | system       | stackchan_server.orchestration.loop_engine:initialize:92 | TTS 就绪
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.logging_config:setup_logging:72 | 日志系统初始化完成
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.main:lifespan:70 | ========================================================
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.main:lifespan:71 | StackChan Server v0.2.0 启动
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.main:lifespan:72 |   WebSocket : ws://0.0.0.0:8080/v1/realtime
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.main:lifespan:73 |   健康检查 : http://0.0.0.0:8080/health
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.main:lifespan:74 |   会话管理 : http://0.0.0.0:8080/sessions
+2026-07-30 13:35:45.558 | INFO     | system       | stackchan_server.main:lifespan:77 | 初始化引擎...
+2026-07-30 13:35:45.580 | INFO     | system       | stackchan_server.main:lifespan:99 |   LLM vllm: Qwen/Qwen2.5-7B-Instruct → http://localhost:8000/v1
+2026-07-30 13:35:46.783 | WARNING  | system       | stackchan_server.engines.llm.llm_engine:check:110 | [DeepSeek] 余额查询失败: Illegal header value b'Bearer '
+2026-07-30 13:35:46.785 | INFO     | system       | stackchan_server.main:lifespan:99 |   LLM deepseek: deepseek-chat → https://api.deepseek.com/v1
+2026-07-30 13:35:46.786 | WARNING  | system       | stackchan_server.engines.stt.stt_engine:start:92 | faster-whisper 未安装，STT 不可用。安装: pip install faster-whisper
+2026-07-30 13:35:46.786 | INFO     | system       | stackchan_server.main:lifespan:114 |   STT: faster_whisper (small)
+2026-07-30 13:35:46.786 | INFO     | system       | stackchan_server.engines.tts.tts_engine:start:81 | TTS 语音: alloy
+2026-07-30 13:35:46.786 | INFO     | system       | stackchan_server.main:lifespan:126 |   TTS: openai_tts (alloy)
+2026-07-30 13:35:46.786 | INFO     | system       | stackchan_server.main:lifespan:135 | SessionManager 就绪 (重连窗口=30.0s, 心跳超时=60.0s)
+2026-07-30 13:35:46.786 | INFO     | system       | stackchan_server.main:lifespan:137 | ========================================================
+2026-07-30 13:35:46.786 | INFO     | system       | stackchan_server.main:lifespan:138 | 服务就绪，等待固件连接...
+2026-07-30 13:36:03.857 | INFO     | system       | stackchan_server.main:lifespan:143 | 正在关闭...
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.logging_config:setup_logging:72 | 日志系统初始化完成
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.main:lifespan:70 | ========================================================
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.main:lifespan:71 | StackChan Server v0.2.0 启动
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.main:lifespan:72 |   WebSocket : ws://0.0.0.0:8080/v1/realtime
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.main:lifespan:73 |   健康检查 : http://0.0.0.0:8080/health
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.main:lifespan:74 |   会话管理 : http://0.0.0.0:8080/sessions
+2026-07-30 13:47:01.068 | INFO     | system       | stackchan_server.main:lifespan:77 | 初始化引擎...
+2026-07-30 13:47:01.092 | INFO     | system       | stackchan_server.main:lifespan:99 |   LLM vllm: Qwen/Qwen2.5-7B-Instruct → http://localhost:8000/v1
+2026-07-30 13:47:02.027 | WARNING  | system       | stackchan_server.engines.llm.llm_engine:check:110 | [DeepSeek] 余额查询失败: Illegal header value b'Bearer '
+2026-07-30 13:47:02.029 | INFO     | system       | stackchan_server.main:lifespan:99 |   LLM deepseek: deepseek-chat → https://api.deepseek.com/v1
+2026-07-30 13:47:02.029 | WARNING  | system       | stackchan_server.engines.stt.stt_engine:start:92 | faster-whisper 未安装，STT 不可用。安装: pip install faster-whisper
+2026-07-30 13:47:02.030 | INFO     | system       | stackchan_server.main:lifespan:114 |   STT: faster_whisper (small)
+2026-07-30 13:47:02.030 | INFO     | system       | stackchan_server.engines.tts.tts_engine:start:81 | TTS 语音: alloy
+2026-07-30 13:47:02.030 | INFO     | system       | stackchan_server.main:lifespan:126 |   TTS: openai_tts (alloy)
+2026-07-30 13:47:02.030 | INFO     | system       | stackchan_server.main:lifespan:135 | SessionManager 就绪 (重连窗口=30.0s, 心跳超时=60.0s)
+2026-07-30 13:47:02.030 | INFO     | system       | stackchan_server.main:lifespan:137 | ========================================================
+2026-07-30 13:47:02.030 | INFO     | system       | stackchan_server.main:lifespan:138 | 服务就绪，等待固件连接...
+2026-07-30 13:47:11.272 | INFO     | session_mgr  | stackchan_server.api.session_manager:get_or_create:102 | 设备 stackchan-8e549d22 会话已创建 (总数: 1)
+2026-07-30 13:47:11.272 | INFO     | stackchan-8e549d22 | stackchan_server.api.ws_handler:realtime_websocket:107 | WebSocket 连接建立
+2026-07-30 13:47:11.272 | INFO     | stackchan-8e549d22 | stackchan_server.api.ws_handler:_dispatch:164 | 会话就绪: model=gpt-realtime
+2026-07-30 13:48:17.031 | INFO     | session_mgr  | stackchan_server.api.session_manager:_cleanup:169 | 设备 stackchan-8e549d22 心跳超时 (60.0s)，清理僵尸会话
+2026-07-30 13:48:30.415 | INFO     | stackchan-8e549d22 | stackchan_server.api.ws_handler:realtime_websocket:139 | WebSocket 断开
+2026-07-30 13:48:30.415 | INFO     | stackchan-8e549d22 | stackchan_server.protocol.session:close:244 | 会话关闭
+2026-07-30 13:50:13.693 | INFO     | system       | stackchan_server.main:lifespan:143 | 正在关闭...

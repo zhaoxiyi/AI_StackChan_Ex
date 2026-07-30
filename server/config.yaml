@@ -1,0 +1,145 @@
+# =============================================================================
+# StackChan Server Configuration
+# 全双工 AI 对话上位机服务配置
+# =============================================================================
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  # WebSocket endpoint that mimics OpenAI Realtime API
+  ws_path: "/v1/realtime"
+  # Health check endpoint
+  health_path: "/health"
+
+# ---------------------------------------------------------------------------
+# Model Routing Configuration (模型路由)
+# ---------------------------------------------------------------------------
+routing:
+  # Default model for general conversation
+  default_model: "vllm"
+  # Models available for routing
+  models:
+    vllm:
+      enabled: true
+      description: "Local vLLM model for daily conversation"
+      # vLLM OpenAI-compatible endpoint
+      base_url: "http://localhost:8000/v1"
+      api_key: "not-needed"
+      model_name: "Qwen/Qwen2.5-7B-Instruct"
+      max_tokens: 2048
+      temperature: 0.7
+    deepseek:
+      enabled: true
+      description: "DeepSeek cloud API for complex tasks"
+      base_url: "https://api.deepseek.com/v1"
+      api_key: "${DEEPSEEK_API_KEY}"
+      model_name: "deepseek-chat"
+      max_tokens: 4096
+      temperature: 0.7
+      # Billing monitoring
+      billing:
+        # Two-level threshold for balance alerts
+        balance_warning_threshold: 10.0    # CNY - warn user
+        balance_critical_threshold: 2.0    # CNY - force fallback to vLLM
+        check_interval_minutes: 60
+
+# ---------------------------------------------------------------------------
+# Speech-to-Text Configuration (语音识别)
+# ---------------------------------------------------------------------------
+stt:
+  # Engine: whisper_local | whisper_openai | faster_whisper
+  engine: "faster_whisper"
+  faster_whisper:
+    model_size: "small"              # tiny, base, small, medium, large-v3
+    device: "cuda"                   # cuda or cpu
+    compute_type: "float16"          # float16, int8_float16, int8
+    language: "ja"                   # ja, zh, en, auto
+    beam_size: 5
+    vad_filter: true
+    vad_threshold: 0.5
+    min_silence_duration_ms: 500
+  # Alternative: OpenAI Whisper API
+  openai_whisper:
+    enabled: false
+    api_key: "${OPENAI_API_KEY}"
+    model: "whisper-1"
+    language: "ja"
+  # Audio format from StackChan firmware
+  audio:
+    input_sample_rate: 16000          # Actual firmware recording rate
+    input_channels: 1
+    input_sample_width: 2             # 16-bit PCM
+    chunk_samples: 2000               # ~125ms per chunk
+    output_sample_rate: 24000         # Playback rate expected by firmware
+
+# ---------------------------------------------------------------------------
+# Text-to-Speech Configuration (语音合成)
+# ---------------------------------------------------------------------------
+tts:
+  # Engine: openai_tts | voicevox | edge_tts
+  engine: "openai_tts"
+  openai_tts:
+    api_key: "${OPENAI_API_KEY}"
+    base_url: "https://api.openai.com/v1"
+    model: "tts-1"
+    voice: "alloy"                   # alloy, echo, fable, onyx, nova, shimmer
+    response_format: "pcm"           # pcm for raw audio
+    speed: 1.0
+  # Alternative: VOICEVOX (Japanese)
+  voicevox:
+    enabled: false
+    base_url: "http://localhost:50021"
+    speaker: 3                        # 3 = Zundamon
+  # Alternative: Edge TTS (free, good quality)
+  edge_tts:
+    enabled: false
+    voice: "ja-JP-NanamiNeural"       # Japanese voice
+  audio:
+    sample_rate: 24000                # Must match firmware expectation
+
+# ---------------------------------------------------------------------------
+# Conversation Configuration (对话配置)
+# ---------------------------------------------------------------------------
+conversation:
+  # System prompt for the AI assistant
+  system_prompt: |
+    You are Stack-chan, a friendly desktop robot assistant.
+    You speak naturally and concisely, like having a real conversation.
+    Keep your responses short and conversational - usually 1-3 sentences.
+    You are helpful, warm, and a bit playful.
+    
+    Current context: You are talking to your owner through voice.
+    Respond in the same language the user speaks.
+  
+  # Turn detection
+  turn:
+    silence_timeout_ms: 2000          # Stop listening after 2s silence
+    max_recording_ms: 30000           # Max recording duration (matches firmware)
+    min_speech_ms: 200                # Minimum speech duration to trigger
+  
+  # Interruption
+  interruption:
+    enabled: true
+    # How to handle when user interrupts during response
+    strategy: "immediate_stop"        # immediate_stop | fade_out | queue
+  
+  # Conversation history
+  history:
+    max_messages: 20                  # Keep last N messages in context
+    enable_summary: true              # Summarize old messages
+    summary_trigger_count: 15         # Trigger summary after N messages
+    summary_model: "vllm"             # Use local model for summarization
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"                        # DEBUG, INFO, WARNING, ERROR
+  format: "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {extra[session_id]: <12} | {message}"
+  file:
+    enabled: true
+    path: "logs/stackchan_server.log"
+    rotation: "100 MB"
+    retention: "7 days"
+  # Enable per-session trace logging
+  session_tracing: true
