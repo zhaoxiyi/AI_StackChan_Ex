@@ -5,7 +5,12 @@
 ## 概述
 
 StackChan Server 是一个完全兼容 [AI_StackChan_Ex](https://github.com/ronron-gh/AI_StackChan_Ex) 固件端 **OpenAI Realtime API 协议**的本地服务，替代云端 Realtime API，实现私有化部署的全双工语音对话。
-StackChan Server 部分由豆包建议生成 Prompt ，通过 CodeWhale 工具自生成。豆包建议prompt已经保存与本地dm文件。CodeWhale生成过程输出，包括过程中几处需要 Debug 的错误也保留在 md 文件中，修复过程也通过 CodeWhale 完成，基本没有人工参与。保留各方面信息供后续工作参考。
+
+- 当前 StackChan Server 模块由豆包建议生成 Prompt ，通过 CodeWhale 工具自生成。豆包建议prompt已经保存与本地dm文件。
+- CodeWhale 生成过程输出，包括过程中几处需要 Debug 的错误也保留在 md 文件中.
+- 修复过程也通过 CodeWhale 完成，基本没有人工参与。保留各方面信息供后续工作参考。
+- 初期项目创建及调试花费 8.22￥ 。131次API调用。 消耗 22,221,367 Tokens。
+  
 
 ### 核心特性
 
