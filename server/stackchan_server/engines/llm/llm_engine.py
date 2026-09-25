@@ -90,7 +90,7 @@ class BalanceChecker:
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(15, connect=5),
+                timeout=httpx.Timeout(5, connect=2),
                 headers={"Authorization": f"Bearer {self._api_key}"},
             ) as client:
                 r = await client.get(f"{self._base_url.rstrip('/')}/user/balance")
@@ -188,7 +188,7 @@ class LLMEngine(BaseLLM):
             headers=headers,
         )
 
-        # DeepSeek 余额检测
+        # DeepSeek 余额检测 — 后台异步检查，不阻塞启动
         if self._backend == "deepseek":
             self._balance_checker = BalanceChecker(
                 api_key=config.api_key,
@@ -196,8 +196,9 @@ class LLMEngine(BaseLLM):
                 warning_threshold=config.extra.get("warning_threshold_cny", 10.0),
                 critical_threshold=config.extra.get("critical_threshold_cny", 2.0),
             )
-            # 启动时检查一次余额
-            await self._balance_checker.check()
+            # 后台检查，不阻塞启动
+            import asyncio
+            asyncio.create_task(self._balance_checker.check())
 
         self._state = EngineState.READY
 
@@ -248,11 +249,11 @@ class LLMEngine(BaseLLM):
 
         endpoint = f"{self._config.endpoint.rstrip('/')}/chat/completions" if self._config else ""
 
+        full_response: list[str] = []
         try:
             async with self._http.stream("POST", endpoint, json=body) as resp:
                 await self._check_response(resp)
                 async for line in resp.aiter_lines():
-                    # 取消检查
                     if self._cancel_event.is_set():
                         await resp.aclose()
                         self._state = EngineState.CANCELLED
@@ -266,6 +267,7 @@ class LLMEngine(BaseLLM):
 
                     chunk = self._parse_chunk(data_str)
                     if chunk:
+                        full_response.append(chunk)
                         yield chunk
 
             self._state = EngineState.READY

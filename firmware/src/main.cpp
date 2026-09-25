@@ -162,13 +162,70 @@ bool Wifi_connection_check() {
     M5.Display.print(".");
     Serial.print(".");
     delay(1000);
-    // 5秒以上接続できなかったら抜ける
-    if ( 5000 < (millis() - start_millis) ) {
+    // 15秒以上接続できなかったら抜ける
+    // (双频合一路由器 Band Steering 下握手常需 5-10 秒, 原 5 秒太短)
+    if ( 15000 < (millis() - start_millis) ) {
       //break;
       return false;
     }
   }
   return true;
+}
+
+/**
+ * @brief 优先连接目标 SSID 的 2.4GHz 接入点 (BSSID 锁定)
+ *
+ * 双频合一 (Band Steering) 路由器会尝试把客户端引导到 5GHz,
+ * ESP32 只支持 2.4GHz, 引导过程常导致普通 WiFi.begin 握手失败。
+ * 本函数扫描目标 SSID 的所有信标, 找到 2.4GHz (信道 1-13) 且
+ * 信号最强的 BSSID, 用 BSSID 定向连接, 绕过频段引导。
+ *
+ * @return true 连接成功
+ */
+bool wifiConnectWith2GPreference(const char* ssid, const char* pass) {
+  WiFi.setSleep(false);          // 关闭 modem sleep, 提升握手稳定性
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(100);
+
+  // 扫描目标 SSID 的信标
+  int n = WiFi.scanNetworks();
+  Serial.printf("[WiFi] 扫描到 %d 个网络\n", n);
+  if (n > 0) {
+    Serial.println("[WiFi] 扫描结果:");
+    for (int i = 0; i < n; i++) {
+      Serial.printf("  %-24s ch=%2d rssi=%4d\n",
+                    WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+    }
+  }
+
+  // 找目标 SSID 的 2.4G 信标 (最强信号)
+  uint8_t bssid[6];
+  bool found2g = false;
+  int bestRssi = -999;
+  int bestCh = 0;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) != String(ssid)) continue;
+    int ch = WiFi.channel(i);
+    if (ch >= 1 && ch <= 13) {          // 2.4GHz 信道范围
+      if (WiFi.RSSI(i) > bestRssi) {
+        bestRssi = WiFi.RSSI(i);
+        bestCh = ch;
+        memcpy(bssid, WiFi.BSSID(i), 6);
+        found2g = true;
+      }
+    }
+  }
+
+  if (found2g) {
+    Serial.printf("[WiFi] 锁定 2.4G AP: %s ch=%d rssi=%d\n", ssid, bestCh, bestRssi);
+    WiFi.begin(ssid, pass, 0, bssid);   // BSSID 定向连接, 绕过频段引导
+  } else {
+    Serial.printf("[WiFi] 未找到 2.4G 信标, 普通连接: %s\n", ssid);
+    WiFi.begin(ssid, pass);
+  }
+
+  return Wifi_connection_check();
 }
 
 bool WifiSmartConfig() {
@@ -369,7 +426,9 @@ void setup()
                                      "/SC_SecConfig.yaml", 2048,
                                      "/SC_BasicConfig.yaml", 2048);
 #else
-  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+  // 強化 SD 挂载: 文件系统识别 + 多频率降级重试 (SDUtil.cpp)
+  // 解决部分 SD 卡在 25MHz 下不稳定或格式不被识别的问题
+  if (sdBeginEx(GPIO_NUM_4, 25000)) {
     // この関数ですべてのYAMLファイル(Basic, Secret, Extend)を読み込む
     system_config.loadConfig(SD, "/app/AiStackChanEx/SC_ExConfig.yaml");
 #endif
@@ -398,8 +457,8 @@ void setup()
           isOffline = true;
         }
       }else{
-        WiFi.begin(wifi_info->ssid.c_str(), wifi_info->password.c_str());
-        if(Wifi_connection_check()){
+        // BSSID 锁定 2.4G 连接 (双频合一路由器 Band Steering 兼容)
+        if(wifiConnectWith2GPreference(wifi_info->ssid.c_str(), wifi_info->password.c_str())){
           // SDカード設定による接続に成功。
           Serial.println("Successfully established a Wi-Fi connection via the SD card settings.");
         }else{

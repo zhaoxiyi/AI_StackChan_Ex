@@ -98,9 +98,19 @@ class STTEngine(BaseSTT):
         device = config.extra.get("device", "cuda")
         compute_type = config.extra.get("compute_type", "float16")
 
-        self._model = await asyncio.to_thread(
-            WhisperModel, model_size, device=device, compute_type=compute_type
-        )
+        try:
+            self._model = await asyncio.wait_for(
+                asyncio.to_thread(
+                    WhisperModel, model_size, device=device, compute_type=compute_type
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            self._state = EngineState.ERROR
+            get_session_logger("system").warning(
+                "faster-whisper 模型下载超时 (30s)，STT 不可用。请检查网络或手动下载模型。"
+            )
+            return
 
         # Silero VAD
         if config.extra.get("use_vad", True):

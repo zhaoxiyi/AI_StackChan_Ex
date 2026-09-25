@@ -38,9 +38,13 @@ from stackchan_server.api.ws_handler import (
     set_global_engines,
 )
 from stackchan_server.api.http_routes import http_router
+from stackchan_server.api.admin import admin_router
 from stackchan_server.engines.llm.llm_engine import LLMEngine
 from stackchan_server.engines.stt.stt_engine import STTEngine
+from stackchan_server.engines.stt.cpu_stt_engine import CpuSTTEngine
+from stackchan_server.engines.stt.sensevoice_engine import SenseVoiceSTTEngine
 from stackchan_server.engines.tts.tts_engine import TTSEngine
+from stackchan_server.engines.tts.cpu_tts_engine import CpuTTSEngine
 from stackchan_server.engines.base import EngineConfig
 
 
@@ -85,7 +89,7 @@ async def lifespan(app: FastAPI):
             extra: dict = {}
             if name == "deepseek":
                 extra["backend"] = "deepseek"
-                if entry.api_key.startswith("${"):
+                if not entry.api_key or entry.api_key.startswith("${"):
                     logger.warning(f"DeepSeek API Key 未设置，跳过")
                     continue
             await eng.start(EngineConfig(
@@ -100,32 +104,86 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"  LLM {name} 启动失败: {e}")
 
-    # STT
-    stt = STTEngine()
+    # STT — 根据配置选择引擎
     stt_cfg = cfg.stt
-    try:
-        await stt.start(EngineConfig(
-            engine_type="stt",
-            extra={
-                "model_size": stt_cfg.faster_whisper.model_size,
-                "device": stt_cfg.faster_whisper.device,
-            },
-        ))
-        logger.info(f"  STT: {stt_cfg.engine} ({stt_cfg.faster_whisper.model_size})")
-    except Exception as e:
-        logger.warning(f"  STT 启动失败: {e}")
+    if stt_cfg.engine == "sensevoice":
+        stt = SenseVoiceSTTEngine()
+        try:
+            c = stt_cfg.sensevoice
+            await stt.start(EngineConfig(
+                engine_type="stt",
+                extra={
+                    "model_source": c.model_source,
+                    "model_name": c.model_name,
+                    "use_int8": c.use_int8,
+                    "num_threads": c.num_threads,
+                    "use_itn": c.use_itn,
+                    "silence_break_ms": c.silence_break_ms,
+                    "max_audio_ms": c.max_audio_ms,
+                },
+            ))
+            logger.info(f"  STT: sensevoice (source={c.model_source}, model={c.model_name})")
+        except Exception as e:
+            logger.warning(f"  STT 启动失败: {e}")
+    elif stt_cfg.engine == "cpu_stt":
+        stt = CpuSTTEngine()
+        try:
+            c = stt_cfg.cpu_stt
+            await stt.start(EngineConfig(
+                engine_type="stt",
+                extra={
+                    "model_size": c.model_size,
+                    "device": c.device,
+                    "compute_type": c.compute_type,
+                    "language": c.language,
+                    "beam_size": c.beam_size,
+                    "use_vad": c.use_vad,
+                    "model_source": c.model_source,
+                    "model_name": c.model_name,
+                    "silence_break_ms": c.silence_break_ms,
+                    "max_audio_ms": c.max_audio_ms,
+                },
+            ))
+            logger.info(f"  STT: cpu_stt ({c.model_size} on {c.device}, 源={c.model_source})")
+        except Exception as e:
+            logger.warning(f"  STT 启动失败: {e}")
+    else:
+        stt = STTEngine()
+        try:
+            await stt.start(EngineConfig(
+                engine_type="stt",
+                extra={
+                    "model_size": stt_cfg.faster_whisper.model_size,
+                    "device": stt_cfg.faster_whisper.device,
+                },
+            ))
+            logger.info(f"  STT: {stt_cfg.engine} ({stt_cfg.faster_whisper.model_size})")
+        except Exception as e:
+            logger.warning(f"  STT 启动失败: {e}")
 
-    # TTS
-    tts = TTSEngine()
+    # TTS — 根据配置选择引擎
     tts_cfg = cfg.tts
-    try:
-        await tts.start(EngineConfig(
-            engine_type="tts",
-            extra={"voice": tts_cfg.openai_tts.voice},
-        ))
-        logger.info(f"  TTS: {tts_cfg.engine} ({tts_cfg.openai_tts.voice})")
-    except Exception as e:
-        logger.warning(f"  TTS 启动失败: {e}")
+    if tts_cfg.engine == "cpu_tts":
+        tts = CpuTTSEngine()
+        try:
+            c = tts_cfg.cpu_tts
+            await tts.start(EngineConfig(
+                engine_type="tts",
+                extra={"voice": c.voice, "rate": c.rate, "pitch": c.pitch},
+            ))
+            logger.info(f"  TTS: cpu_tts ({c.voice})")
+        except Exception as e:
+            logger.warning(f"  TTS 启动失败: {e}")
+    else:
+        tts = TTSEngine()
+        try:
+            await tts.start(EngineConfig(
+                engine_type="tts",
+                extra={"voice": tts_cfg.openai_tts.voice},
+            ))
+            logger.info(f"  TTS: {tts_cfg.engine} ({tts_cfg.openai_tts.voice})")
+        except Exception as e:
+            logger.warning(f"  TTS 启动失败: {e}")
 
     # 注入全局引擎
     set_global_engines(llm_pool, stt, tts)
@@ -164,6 +222,7 @@ app.add_middleware(
 )
 
 app.include_router(ws_router)
+app.include_router(admin_router)
 app.include_router(http_router)
 
 

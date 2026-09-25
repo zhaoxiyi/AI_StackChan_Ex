@@ -47,13 +47,37 @@ routing:
 # Speech-to-Text Configuration (语音识别)
 # ---------------------------------------------------------------------------
 stt:
-  # Engine: whisper_local | whisper_openai | faster_whisper
-  engine: "faster_whisper"
+  # Engine: sensevoice | cpu_stt | faster_whisper | openai_whisper
+  #   sensevoice: 阿里 SenseVoice，ModelScope 下载，中/粤/日/英/韩 自动检测 (推荐)
+  #   cpu_stt: faster-whisper 纯 CPU 版，HuggingFace/ModelScope 下载
+  #   faster_whisper: GPU 加速版本
+  engine: "sensevoice"
+  sensevoice:
+    # 模型源: huggingface(官方发布, 推荐) | modelscope(社区) | local(本地路径)
+    model_source: "huggingface"
+    # modelscope 源的模型 ID (社区模型 ITN 后处理可能崩溃, 不推荐)
+    model_name: "danieldong/sensevoice-small-onnx-quant"
+    use_int8: true               # 仅 modelscope 源有效: True=model.int8.onnx
+    num_threads: 4               # onnxruntime 线程数
+    use_itn: true                # 逆文本归一化 (数字/日期自动转写)
+    silence_break_ms: 1200       # 静音断句阈值 (阶段性停顿才触发识别)
+    max_audio_ms: 15000          # 音频最长累积
+  cpu_stt:
+    model_size: "small"              # tiny, base, small, medium
+    device: "auto"                   # auto, cpu, cuda
+    compute_type: "auto"             # auto, float16, int8
+    language: null                   # null=自动检测, zh, ja, en
+    beam_size: 5
+    use_vad: true
+    model_source: "huggingface"      # huggingface, modelscope, local
+    model_name: ""                   # ModelScope 模型 ID 或 local 路径
+    silence_break_ms: 800            # 静音断句阈值 (毫秒)
+    max_audio_ms: 15000              # 音频最长累积 (毫秒)
   faster_whisper:
     model_size: "small"              # tiny, base, small, medium, large-v3
     device: "cuda"                   # cuda or cpu
     compute_type: "float16"          # float16, int8_float16, int8
-    language: "ja"                   # ja, zh, en, auto
+    language: "zh"                   # ja, zh, en, auto
     beam_size: 5
     vad_filter: true
     vad_threshold: 0.5
@@ -63,7 +87,7 @@ stt:
     enabled: false
     api_key: "${OPENAI_API_KEY}"
     model: "whisper-1"
-    language: "ja"
+    language: "zh"
   # Audio format from StackChan firmware
   audio:
     input_sample_rate: 16000          # Actual firmware recording rate
@@ -76,8 +100,14 @@ stt:
 # Text-to-Speech Configuration (语音合成)
 # ---------------------------------------------------------------------------
 tts:
-  # Engine: openai_tts | voicevox | edge_tts
-  engine: "openai_tts"
+  # Engine: cpu_tts | openai_tts | voicevox
+  #   cpu_tts: 纯 CPU 可运行，基于 edge-tts (需联网) (推荐开发环境)
+  #   openai_tts: OpenAI 云端 TTS
+  engine: "cpu_tts"
+  cpu_tts:
+    voice: "zh-CN-XiaoxiaoNeural"   # edge-tts 语音角色 (中文优化)
+    rate: "+0%"                     # 语速 -20% ~ +20%
+    pitch: "+0Hz"                   # 音调 -20Hz ~ +20Hz
   openai_tts:
     api_key: "${OPENAI_API_KEY}"
     base_url: "https://api.openai.com/v1"
@@ -129,6 +159,13 @@ conversation:
     enable_summary: true              # Summarize old messages
     summary_trigger_count: 15         # Trigger summary after N messages
     summary_model: "vllm"             # Use local model for summarization
+
+  # 语句评估: 断句识别的文本是否完整、是否提交 LLM
+  utterance:
+    min_chars: 2                      # 最短有效文本 (低于此长度视为噪声)
+    submit_punctuation: "。！？!?.;…"  # 句末标点 = 语句完整 → 立即提交
+    submit_min_chars_no_punct: 15     # 无标点时累积多少字才提交
+    max_pending_chars: 100            # 累积上限, 强制提交
 
 # ---------------------------------------------------------------------------
 # Logging Configuration

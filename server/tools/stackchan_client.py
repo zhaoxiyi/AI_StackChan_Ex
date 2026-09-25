@@ -1,32 +1,12 @@
 #!/usr/bin/env python3
 """
-StackChan 模拟客户端 — 用于无硬件调试 + 自动化回归测试
+StackChan 模拟客户端 v4 — 线程级键盘 + 阻塞式录音 + 全链路日志
 
-用法:
-    # 实时麦克风交互模式
-    python tools/stackchan_client.py --host 127.0.0.1 --port 8080
-
-    # WAV 文件输入模式 (自动化测试)
-    python tools/stackchan_client.py --host 127.0.0.1 --port 8080 --wav test_input.wav
-
-    # 保存接收的音频到文件
-    python tools/stackchan_client.py --host 127.0.0.1 --port 8080 --save-output out.wav
-
-键盘控制 (交互模式):
-    i     → 打断当前回复
-    q/ESC → 退出
-
-依赖:
-    pip install websockets sounddevice numpy
-
-协议对齐说明:
-    本客户端完全模拟 AI_StackChan_Ex 固件端的 Realtime API 行为:
-      - 录音: PCM 16-bit, 16kHz, mono, 2000 samples/chunk (~125ms)
-      - 上传: JSON 文本帧 {"type":"input_audio_buffer.append","audio":"<base64>"}
-      - 接收: JSON 文本帧 {"type":"response.output_audio.delta","delta":"<base64>"}
-      - 接收: 24kHz PCM 输出 (服务端合成)
-      - 信令: session.update → session.updated → audio.commit → audio.delta → response.done
-      - 打断: response.cancel 文本帧
+彻底修复:
+  1. 键盘: 独立 daemon 线程 + select.select + os.read (不依赖 loop.add_reader)
+  2. Ctrl-C: 双重路径 — \\x03 字符退出 + Python SIGINT handler
+  3. 音频: sd.rec(blocking=True) in executor, RMS 实时打印
+  4. 日志: 每个操作都打印 DEBUG 日志
 """
 
 from __future__ import annotations
@@ -35,680 +15,1192 @@ import argparse
 import asyncio
 import base64
 import json
+import os
+import select
 import signal
 import sys
+import termios
+import threading
 import time
+import tty
 import wave
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 # =============================================================================
-# 依赖检查 (可选依赖，缺失时优雅降级)
+# 依赖
 # =============================================================================
-
 try:
     import websockets
 except ImportError:
-    print("请安装 websockets: pip install websockets")
+    print("pip install websockets")
     sys.exit(1)
 
 try:
     import sounddevice as sd
-    _HAS_AUDIO = True
+    _HAS_SD = True
 except ImportError:
-    print("警告: sounddevice 未安装，音频采集/播放功能不可用")
-    print("安装: pip install sounddevice numpy")
-    _HAS_AUDIO = False
-
+    _HAS_SD = False
+    print("[WARN] sounddevice 未安装，麦克风和播放不可用。pip install sounddevice")
 
 # =============================================================================
-# 协议常量 — 严格对齐固件端
+# 常量
 # =============================================================================
+SR_IN = 16000               # 固件协议: RT_REC_SAMPLE_RATE=16000, 服务端 STT 期望 16kHz
+SR_OUT = 24000
+CHUNK = 2000               # samples
+CHUNK_MS = 125.0           # ms (WAV 模式发送节奏)
+CHUNK_BYTES = CHUNK * 2    # bytes
+MIC_CHUNK_MS = 250.0       # 录音 callback 块时长 (250ms, callback 频率 4 次/秒 → 降低 overflow)
+VAD_THR = 200.0
+SILENCE_TIMEOUT_MS = 30000.0  # 静音累计提交阈值 (30 秒)
+MAX_SILENT = 240           # 兼容保留 (不再使用块数判断)
 
-# 录音参数 (对齐 RealtimeLLMBase.h)
-SAMPLE_RATE_INPUT: int = 16000          # 固件 RT_REC_SAMPLE_RATE
-CHUNK_SAMPLES: int = 2000               # 固件 RT_REC_LENGTH
-CHUNK_DURATION_MS: float = 125.0        # 2000/16000*1000
-
-# 播放参数 (对齐 streamAudioDelta)
-SAMPLE_RATE_OUTPUT: int = 24000         # 固件 playRaw 24kHz
-
-# 录音超时 (对齐 REALTIME_RECORD_TIMEOUT)
-RECORD_TIMEOUT_S: float = 30.0
-
-# VAD 静音阈值 (RMS)
-VAD_THRESHOLD: float = 200.0
-
-
-# =============================================================================
-# 延迟统计
-# =============================================================================
 
 @dataclass
-class LatencyStats:
-    """延迟统计"""
-    first_token_ms: float = 0.0          # 首 token 延迟 (commit → 第一个 text delta)
-    first_audio_ms: float = 0.0          # 首帧音频延迟 (commit → 第一个 audio delta)
-    total_turn_ms: float = 0.0           # 总轮次延迟 (commit → response.done)
-    commit_time: float = 0.0             # 记录 commit 发送时间
-    text_count: int = 0
-    audio_count: int = 0
+class Stats:
+    first_token_ms: float = 0.0
+    first_audio_ms: float = 0.0
+    total_ms: float = 0.0
+    commit_at: float = 0.0
+    texts: int = 0
+    audios: int = 0
 
-    def reset(self) -> None:
+    def reset(self):
         self.__init__()
+
+
+# =============================================================================
+# 键盘 — 独立线程 + select + os.read
+# =============================================================================
+
+class Kbd:
+    """
+    完全独立的 daemon 线程读取键盘。
+    不依赖 asyncio loop.add_reader（在某些环境下不可靠）。
+    """
+
+    def __init__(self):
+        self._q: asyncio.Queue[str] = asyncio.Queue()
+        self._fd = sys.stdin.fileno()
+        self._old = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def input_queue(self) -> asyncio.Queue[str]:
+        return self._q
+
+    def start(self) -> None:
+        if self._running:
+            return
+
+        if not sys.stdin.isatty():
+            print("[KBD] stdin 不是 TTY，键盘输入不可用")
+            return
+
+        self._old = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="kbd")
+        self._thread.start()
+        print("[KBD] 键盘线程已启动 (cbreak + select)")
+
+    def stop(self) -> None:
+        self._running = False
+        if self._old:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+            except Exception:
+                pass
+            self._old = None
+        print("[KBD] 键盘线程已停止，终端已恢复")
+
+    def _run(self) -> None:
+        """线程主循环: select → os.read → queue"""
+        while self._running:
+            try:
+                r, _, _ = select.select([self._fd], [], [], 0.1)
+                if r:
+                    data = os.read(self._fd, 16)
+                    for b in data:
+                        ch = chr(b) if 32 <= b < 127 else (
+                            "\x1b" if b == 27 else
+                            "\x03" if b == 3 else
+                            "\x04" if b == 4 else
+                            chr(b).lower() if b >= 128 else ""
+                        )
+                        if ch:
+                            try:
+                                self._q.put_nowait(ch)
+                            except asyncio.QueueFull:
+                                pass
+            except Exception:
+                pass
+
+
+# =============================================================================
+# 客户端
+# =============================================================================
+
+class Client:
+
+    def __init__(self, host="127.0.0.1", port=8080, dev="sim-001",
+                 wav=None, out_wav=None, mic_device=None):
+        self.host = host
+        self.port = port
+        self.dev = dev
+        self.wav_file = wav
+        self.out_wav = out_wav
+        self.mic_device = mic_device  # None=默认, int=索引, str=名称子串
+
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.kbd = Kbd()
+        self.stats = Stats()
+        self.obuf = bytearray()
+        self.running = True
+        # 录音流 (callback 模式, 无 executor 线程)
+        self._mic_stream = None
+        self._mic_queue: Optional[asyncio.Queue] = None
+        self._out_stream = None           # 播放流 (显式管理, 不用 sd.play/sd.stop)
+        # 发送解耦: 主循环入队, 后台 sender 顺序发送 (WebSocket 背压不阻塞消费)
+        self._send_queue: Optional[asyncio.Queue] = None
+        self._sender_task: Optional[asyncio.Task] = None
+        # task 引用
+        self._recv_task = None
+        self._mic_task = None
+        self._wav_task = None
+
+    # ==================================================================
+    # 入口
+    # ==================================================================
+
+    async def run(self):
+        signal.signal(signal.SIGINT, self._on_sig)
+        signal.signal(signal.SIGTERM, self._on_sig)
+
+        url = f"ws://{self.host}:{self.port}/v1/realtime?model=gpt-realtime"
+        log(f"连接: {url}")
+        self.kbd.start()
+
+        try:
+            async with websockets.connect(
+                url, ping_interval=30, ping_timeout=10,
+                close_timeout=5, max_size=2 ** 23,
+            ) as ws:
+                self.ws = ws
+                await self._send_json({
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime", "model": "gpt-realtime",
+                        "output_modalities": ["audio"],
+                        "audio": {
+                            "input": {"format": {"type": "audio/pcm", "rate": SR_IN},
+                                      "turn_detection": {"type": "semantic_vad"}},
+                            "output": {"format": {"type": "audio/pcm", "rate": SR_OUT},
+                                       "voice": "alloy"},
+                        },
+                        "instructions": "You are Stack-chan.",
+                        "tools": [], "tool_choice": "auto", "temperature": 0.8,
+                    },
+                })
+                log("[SEND] session.update")
+
+                if self.wav_file:
+                    self._recv_task = asyncio.create_task(self._recv(), name="recv")
+                    self._wav_task = asyncio.create_task(self._wav_mode(), name="wav")
+                    await asyncio.wait([self._wav_task], return_when=asyncio.FIRST_COMPLETED)
+                else:
+                    self._recv_task = asyncio.create_task(self._recv(), name="recv")
+                    self._mic_task = asyncio.create_task(self._mic_mode(), name="mic")
+                    await asyncio.wait([self._mic_task], return_when=asyncio.FIRST_COMPLETED)
+
+                await self._wait(20)
+                # 收尾 task: 消费取消避免 "exception never retrieved" 警告
+                for t in (self._recv_task, self._mic_task, self._wav_task):
+                    if t and not t.done():
+                        t.cancel()
+                for t in (self._recv_task, self._mic_task, self._wav_task):
+                    if t:
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+        except websockets.ConnectionClosed as e:
+            log(f"WS 关闭: {e}")
+        except Exception as e:
+            log(f"异常: {type(e).__name__}: {e}")
+        finally:
+            self.running = False
+            self._close_mic_stream()
+            self._stop_playback()
+            self.kbd.stop()
+            if self.out_wav and self.obuf:
+                _wav_save(self.out_wav, bytes(self.obuf), SR_OUT)
+                log(f"保存: {self.out_wav}")
+            self._stat()
+
+    def _on_sig(self, *args):
+        log("收到信号，退出")
+        self.running = False
+        # 线程安全地触发 shutdown（强制关闭 WS 让 _recv 和 _wait 立即退出）
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(self._force_shutdown)
+        except Exception as e:
+            log(f"Shutown ws exception: {e}")
+
+    def _force_shutdown(self):
+        """在 event loop 线程中执行：关闭 WS + 取消所有 task"""
+        self.running = False
+        for attr in ("_recv_task", "_mic_task", "_wav_task"):
+            t = getattr(self, attr, None)
+            if t and not t.done():
+                t.cancel()
+        if self.ws:
+            asyncio.create_task(self._close_ws())
+
+    async def _close_ws(self):
+        try:
+            await self.ws.close()
+        except Exception as e:
+            log(f"Shutown ws exception: {e}")
+
+    # ==================================================================
+    # 设备选择
+    # ==================================================================
+
+    def _resolve_mic(self):
+        """
+        解析 mic_device 参数，返回 (device_id, native_sample_rate)。
+
+        None → 系统默认 (无效时自动选第一个有效输入设备)
+        int  → 直接使用 (越界或非输入设备时回退)
+        str  → 按名称子串匹配（大小写不敏感）
+
+        Returns:
+            (device_id: Optional[int], native_rate: int)
+            native_rate 取自设备 default_samplerate (自适应)，
+            录音用 native_rate，发送前重采样到 SR_IN (16kHz, 协议要求)。
+        """
+        devs = sd.query_devices()
+
+        # PulseAudio/PipeWire 别名设备 — PortAudio 打开后数据不流动 (假活), 优先排除
+        _ALIAS_NAMES = ("default", "pulse", "pipewire", "combined", "simultaneous", "null")
+
+        def _is_real_input(i: int) -> bool:
+            d = devs[i]
+            if d['max_input_channels'] <= 0:
+                return False
+            name = d['name'].strip().lower()
+            return not any(a in name for a in _ALIAS_NAMES)
+
+        # 所有有效输入设备索引 (真实物理设备优先)
+        input_idxs = [i for i, d in enumerate(devs) if d['max_input_channels'] > 0]
+        real_idxs = [i for i in input_idxs if _is_real_input(i)]
+
+        def _get_rate(di: Optional[int]) -> int:
+            """设备原生采样率。无效值 (<=0) 回退 SR_IN"""
+            if di is None or di < 0 or di >= len(devs):
+                return SR_IN
+            r = int(devs[di].get('default_samplerate', 0) or 0)
+            return r if r > 0 else SR_IN
+
+        def _is_input(di: Optional[int]) -> bool:
+            return di is not None and 0 <= di < len(devs) and devs[di]['max_input_channels'] > 0
+
+        # 优先真实物理设备, 没有才退回别名设备
+        preferred = real_idxs if real_idxs else input_idxs
+
+        # --- 无输入设备 ---
+        if not input_idxs:
+            log("错误: 系统中没有任何输入设备 (max_input_channels=0)")
+            log("提示: 检查 PulseAudio/PipeWire 配置，或运行 --list-devices 查看")
+            return None, SR_IN
+
+        # --- 默认设备 ---
+        if self.mic_device is None:
+            di = sd.default.device[0]
+            # 默认设备是别名 (假活风险) → 改用真实设备
+            if _is_input(di) and di in real_idxs:
+                rate = _get_rate(di)
+                log(f"麦克风: [默认] #{di} {devs[di]['name']} @ {rate}Hz")
+                return di, rate
+            di = preferred[0]
+            rate = _get_rate(di)
+            log(f"警告: 默认设备 #{sd.default.device[0]} 是别名或不可用，改用 #{di} {devs[di]['name']} @ {rate}Hz")
+            return di, rate
+
+        # --- 指定索引 ---
+        if isinstance(self.mic_device, int):
+            di = self.mic_device
+            if _is_input(di):
+                if di not in real_idxs:
+                    log(f"警告: #{di} {devs[di]['name']} 是 PulseAudio 别名设备，录音可能假活")
+                rate = _get_rate(di)
+                log(f"麦克风: [指定索引] #{di} {devs[di]['name']} @ {rate}Hz")
+                return di, rate
+            log(f"错误: 设备 #{di} 不存在或不是输入设备，自动回退")
+            di = preferred[0]
+            rate = _get_rate(di)
+            log(f"麦克风: [回退] #{di} {devs[di]['name']} @ {rate}Hz")
+            return di, rate
+
+        # --- 名称子串匹配 ---
+        keyword = self.mic_device.lower()
+        for i in preferred:
+            if keyword in devs[i]['name'].lower():
+                rate = _get_rate(i)
+                log(f"麦克风: [匹配] #{i} {devs[i]['name']} @ {rate}Hz")
+                return i, rate
+
+        log(f"警告: 未找到匹配 '{self.mic_device}' 的输入设备，自动选择第一个")
+        di = preferred[0]
+        rate = _get_rate(di)
+        log(f"麦克风: [回退] #{di} {devs[di]['name']} @ {rate}Hz")
+        return di, rate
+
+    def _resolve_mic_candidates(self) -> list[tuple[int, int]]:
+        """
+        返回候选设备列表 [(device_id, native_rate), ...]，按优先级排序。
+
+        排序: 用户指定 > 默认设备(真实) > 其余真实设备 > 别名设备
+        供 _mic_mode 依次尝试，全静音/假活设备自动跳过。
+        """
+        devs = sd.query_devices()
+        _ALIAS_NAMES = ("default", "pulse", "pipewire", "combined", "simultaneous", "null")
+
+        input_idxs = [i for i, d in enumerate(devs) if d['max_input_channels'] > 0]
+        real_idxs = [i for i in input_idxs
+                     if not any(a in devs[i]['name'].strip().lower() for a in _ALIAS_NAMES)]
+        preferred = real_idxs if real_idxs else input_idxs
+
+        def _get_rate(di: int) -> int:
+            r = int(devs[di].get('default_samplerate', 0) or 0)
+            return r if r > 0 else SR_IN
+
+        def _is_input(di) -> bool:
+            return isinstance(di, int) and 0 <= di < len(devs) and devs[di]['max_input_channels'] > 0
+
+        candidates: list[tuple[int, int]] = []
+
+        # 1. 用户显式指定
+        if isinstance(self.mic_device, int) and _is_input(self.mic_device):
+            candidates.append((self.mic_device, _get_rate(self.mic_device)))
+        elif isinstance(self.mic_device, str):
+            kw = self.mic_device.lower()
+            for i in preferred:
+                if kw in devs[i]['name'].lower():
+                    candidates.append((i, _get_rate(i)))
+                    break
+
+        # 2. 系统默认 (真实设备)
+        di = sd.default.device[0]
+        if _is_input(di) and di in real_idxs:
+            candidates.append((di, _get_rate(di)))
+
+        # 3. 其余真实设备
+        for i in preferred:
+            if all(i != c[0] for c in candidates):
+                candidates.append((i, _get_rate(i)))
+
+        # 4. 别名设备兜底
+        for i in input_idxs:
+            if all(i != c[0] for c in candidates):
+                candidates.append((i, _get_rate(i)))
+
+        if not candidates:
+            log("错误: 系统中没有任何输入设备")
+        return candidates
+
+    # ==================================================================
+    # 麦克风模式
+    # ==================================================================
+
+    async def _mic_mode(self):
+        log("[MODE] 麦克风模式")
+        if not _HAS_SD:
+            log("sounddevice 未安装，仅键盘可用")
+            while self.running:
+                ch = await self._kbd_get()
+                if ch in ("q", "\x1b", "\x03"):
+                    self.running = False
+                await asyncio.sleep(0.1)
+            return
+
+        # 候选设备列表 (用户指定 > 默认 > 真实设备 > 别名)
+        candidates = self._resolve_mic_candidates()
+        if not candidates:
+            log("无可用麦克风设备，仅键盘可用")
+            while self.running:
+                ch = await self._kbd_get()
+                if ch in ("q", "\x1b", "\x03"):
+                    self.running = False
+                await asyncio.sleep(0.1)
+            return
+
+        # 依次尝试候选设备: 假活/全静音自动跳过
+        mic_id = None
+        native_rate = SR_IN
+        vad_thr = VAD_THR  # 默认值, 探测成功后覆盖为自适应阈值
+        for cand_id, cand_rate in candidates:
+            cand_chunk = int(cand_rate * MIC_CHUNK_MS / 1000)
+            log(f"尝试设备 #{cand_id} @ {cand_rate}Hz...")
+            r, i = self._open_mic_stream(cand_id, cand_rate, cand_chunk)
+            if self._mic_stream is None:
+                continue
+
+            # 监控 2.5 秒: 检测真实信号 (RMS 峰值)
+            peak_rms = await self._probe_signal(timeout=2.5)
+            if peak_rms > 30.0:
+                mic_id, native_rate = i, r
+                # 自适应 VAD 阈值: 峰值的 40% (下限 40, 上限 500)
+                # 硬编码 200 在低增益麦克风上会漏触发 (本次 RMS=160 < 200 没发送)
+                vad_thr = min(max(peak_rms * 0.4, 40.0), 500.0)
+                log(f"✅ 设备 #{cand_id} 有真实信号 (峰值 RMS={peak_rms:.0f}, VAD 阈值={vad_thr:.0f})")
+                break
+            log(f"⚠️  设备 #{cand_id} 全静音 (峰值 RMS={peak_rms:.0f})，切换下一候选")
+            self._close_mic_stream()
+
+        if mic_id is None:
+            log("所有候选设备均为静音 — 请检查系统麦克风 (amixer / pactl)")
+            log("提示: amixer -c 0 sset Capture 80% 或检查 PulseAudio 输入源")
+            while self.running:
+                ch = await self._kbd_get()
+                if ch in ("q", "\x1b", "\x03"):
+                    self.running = False
+                await asyncio.sleep(0.1)
+            return
+
+        # 计算按原生采样率的 chunk 大小 (250ms, 降低 callback 频率防 overflow)
+        native_chunk = int(native_rate * MIC_CHUNK_MS / 1000)
+        log(f"录音参数: device={mic_id} rate={native_rate}Hz chunk={native_chunk} samples ({MIC_CHUNK_MS:.0f}ms) → 重采样到 {SR_IN}Hz 发送")
+
+        rec = False
+        silent_ms = 0.0
+        chunks_sent = 0
+        stream_started = time.time()
+        got_data = False
+        warned_fake = False
+
+        # 发送解耦: 后台 sender task, 主循环只入队不阻塞
+        self._send_queue = asyncio.Queue(maxsize=64)
+        self._sender_task = asyncio.create_task(self._sender_loop(), name="sender")
+
+        # overflow 报告状态
+        last_report = time.time()
+        prev_overflow = 0
+        prev_dropped = 0
+        last_rms_hint = 0.0
+
+        def _queue_put(kind: str, payload) -> bool:
+            """入队 (非阻塞), 满则计数丢弃"""
+            try:
+                self._send_queue.put_nowait((kind, payload))
+                return True
+            except asyncio.QueueFull:
+                return False
+
+        log("等待语音... (Ctrl-C/q 退出, i 打断)")
+        try:
+            while self.running:
+                ch = await self._kbd_get()
+                if ch:
+                    log(f"[KEY] {repr(ch)}")
+                if ch in ("q", "\x1b", "\x03"):
+                    # 退出前提交未发送的音频 (commit 入队, 保序)
+                    if rec:
+                        log(f"[VAD] 退出前提交 ({chunks_sent} 块)")
+                        _queue_put("commit", None)
+                    self.running = False
+                    break
+                if ch in ("i",):
+                    # 打断: 清空待发送音频, cancel 立即直发 (优先级最高)
+                    while not self._send_queue.empty():
+                        try:
+                            self._send_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    await self._interrupt()
+                    rec = False; silent_ms = 0.0
+
+                # 从 callback 队列取音频 (无阻塞录音)
+                try:
+                    data = await asyncio.wait_for(self._mic_queue.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    # watchdog: 启动 3 秒仍无数据 → 设备假活
+                    if not got_data and not warned_fake and time.time() - stream_started > 3.0:
+                        warned_fake = True
+                        log("⚠️  录音流 3 秒无数据 — 设备可能假活 (PulseAudio 别名) 或系统静音")
+                        log("   建议: python tools/stackchan_client.py --list-devices")
+                        log("   选择名称不是 'default' 的真实物理设备 (如 'Built-in Audio')")
+                    # 低频报告 overflow
+                    if time.time() - last_report > 5.0:
+                        await self._report_overflow(prev_overflow, prev_dropped)
+                        prev_overflow = self._mic_status_counts.get("input_overflow", 0)
+                        prev_dropped = self._mic_dropped
+                        last_report = time.time()
+                    continue
+
+                if not got_data:
+                    got_data = True
+                    log(f"✅ 首个音频块到达 (启动后 {time.time() - stream_started:.2f}s)，录音正常")
+
+                # 重采样到协议采样率 16kHz
+                if native_rate != SR_IN:
+                    data = _resample(data, native_rate, SR_IN)
+
+                r = _rms(data)
+                chunks_sent += 1
+
+                if r > vad_thr:
+                    if not rec:
+                        rec = True; self.stats.reset()
+                        log(f"[VAD] 开始 RMS={r:.0f} (阈值 {vad_thr:.0f})")
+                    silent_ms = 0.0
+                    _queue_put("audio", data)
+                    if chunks_sent % 10 == 0:
+                        log(f"[MIC] 已发送 {chunks_sent} 块 RMS={r:.0f}")
+                elif rec:
+                    # 静音按时间累计 (块长 250ms, 与块数解耦)
+                    silent_ms += MIC_CHUNK_MS
+                    _queue_put("audio", data)
+                    if silent_ms >= SILENCE_TIMEOUT_MS:
+                        log(f"[VAD] 静音 {silent_ms/1000:.0f}s → 提交 ({chunks_sent} 块)")
+                        _queue_put("commit", None)
+                        rec = False; silent_ms = 0.0; chunks_sent = 0
+                else:
+                    # 未触发录音: 低频提示信号强度 (诊断麦克风是否太弱)
+                    if time.time() - last_rms_hint > 3.0:
+                        last_rms_hint = time.time()
+                        log(f"[MIC] 信号 RMS={r:.0f} (触发阈值 {vad_thr:.0f}) — "
+                            f"{'请靠近麦克风或说话' if r < vad_thr else ''}")
+
+                # 低频报告 overflow
+                if time.time() - last_report > 5.0:
+                    await self._report_overflow(prev_overflow, prev_dropped)
+                    prev_overflow = self._mic_status_counts.get("input_overflow", 0)
+                    prev_dropped = self._mic_dropped
+                    last_report = time.time()
+        finally:
+            # 等待发送队列排空 (最多 3 秒), 保证 commit 到达服务器
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not self._send_queue.empty():
+                await asyncio.sleep(0.05)
+            if self._sender_task:
+                self._sender_task.cancel()
+                try:
+                    await self._sender_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._sender_task = None
+            self._close_mic_stream()
+
+    # ==================================================================
+    # 发送队列 (解耦 WebSocket 背压)
+    # ==================================================================
+
+    async def _sender_loop(self) -> None:
+        """
+        后台发送任务 — 从 send_queue 顺序取出并发送。
+
+        主循环只入队 (put_nowait, 无网络 I/O)，
+        WebSocket 慢时背压只阻塞本 task，不影响录音消费。
+        """
+        while True:
+            try:
+                kind, payload = await self._send_queue.get()
+            except asyncio.CancelledError:
+                return
+
+            if kind == "audio":
+                try:
+                    await self._send_audio(payload)
+                except Exception as e:
+                    log(f"[SEND] 音频发送失败: {e}")
+            elif kind == "commit":
+                self.stats.commit_at = time.time()
+                try:
+                    await self._send_json({"type": "input_audio_buffer.commit"})
+                    log("[SEND] audio.commit")
+                except Exception as e:
+                    log(f"[SEND] commit 失败: {e}")
+
+    async def _report_overflow(self, prev_overflow: int, prev_dropped: int) -> None:
+        """低频报告录音流溢出状态"""
+        ovf = self._mic_status_counts.get("input_overflow", 0)
+        drp = self._mic_dropped
+        parts = []
+        if ovf > prev_overflow:
+            parts.append(f"input_overflow +{ovf - prev_overflow} (总 {ovf})")
+        if drp > prev_dropped:
+            parts.append(f"队列满丢弃 +{drp - prev_dropped} (总 {drp})")
+        if parts:
+            log(f"[MIC] ⚠️  {', '.join(parts)} — 音频有丢失")
+
+    async def _probe_signal(self, timeout: float = 2.5) -> float:
+        """
+        探测录音流是否有真实信号。
+
+        消费 mic_queue 中的音频块，计算 RMS 峰值。
+        返回峰值 RMS (全静音设备返回 ~0)。
+        """
+        peak = 0.0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data = await asyncio.wait_for(self._mic_queue.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            r = _rms(data)
+            if r > peak:
+                peak = r
+        return peak
+
+    # ==================================================================
+    # 录音流管理 (callback 模式, 无 executor 阻塞)
+    # ==================================================================
+
+    def _open_mic_stream(self, mic_id: int, native_rate: int, block_samples: int):
+        """
+        打开 callback 录音流。失败自动降级采样率重试。
+
+        callback 在 PortAudio 实时线程运行:
+          - 禁止任何 I/O (print/log 会导致 input overflow!)
+          - 仅计数 + put_nowait 到 asyncio.Queue (线程安全)
+        无 executor 线程 → asyncio.run 退出时不会因阻塞线程卡死。
+
+        Returns:
+            (native_rate, mic_id) 实际使用的参数
+        """
+        self._mic_queue = asyncio.Queue(maxsize=1024)
+        self._mic_status_counts: dict = {}   # status 计数 (主循环低频报告)
+        self._mic_dropped: int = 0           # 队列满丢弃块数
+
+        # CallbackFlags 属性 → 统一计数键
+        _FLAG_NAMES = ("input_overflow", "input_underflow",
+                       "output_underflow", "output_overflow", "priming_output")
+
+        def _cb(indata, frames, time_info, status):
+            # 实时线程: 禁止 I/O，只做原子操作
+            if status:
+                for name in _FLAG_NAMES:
+                    if getattr(status, name, False):
+                        try:
+                            self._mic_status_counts[name] = self._mic_status_counts.get(name, 0) + 1
+                        except Exception:
+                            pass
+            try:
+                # bytes(indata) 直接构造 (C 级转换, 比 copy().tobytes() 快)
+                self._mic_queue.put_nowait(bytes(indata))
+            except asyncio.QueueFull:
+                try:
+                    self._mic_dropped += 1
+                except Exception:
+                    pass
+
+        # 尝试列表: [设备原生率, 44100, 16000] 去重
+        rates = []
+        for r in (native_rate, 44100, SR_IN):
+            if r not in rates:
+                rates.append(r)
+
+        for rate in rates:
+            block = int(rate * MIC_CHUNK_MS / 1000)
+            try:
+                stream = sd.InputStream(
+                    samplerate=rate, channels=1, dtype="int16",
+                    blocksize=block, device=mic_id, callback=_cb,
+                    latency="high",   # 更大的 PortAudio 内部缓冲 → 降低 input overflow
+                )
+                stream.start()
+                self._mic_stream = stream
+                log(f"录音流已启动: device={mic_id} @ {rate}Hz (block={block}={MIC_CHUNK_MS:.0f}ms, latency=high)")
+                return rate, mic_id
+            except Exception as e:
+                log(f"[MIC] 打开 device={mic_id} @ {rate}Hz 失败: {e}")
+
+        self._mic_stream = None
+        return native_rate, mic_id
+
+    def _close_mic_stream(self) -> None:
+        """关闭录音流 (幂等, abort 立即终止不阻塞)"""
+        if self._mic_stream is not None:
+            try:
+                self._mic_stream.abort()  # 立即终止, 不等待缓冲排空
+            except Exception:
+                try:
+                    self._mic_stream.stop()
+                except Exception:
+                    pass
+            try:
+                self._mic_stream.close()
+            except Exception:
+                pass
+            self._mic_stream = None
+            log("[MIC] 录音流已关闭")
+
+    def _play_pcm(self, pcm: bytes) -> None:
+        """播放 PCM (显式 OutputStream, 与录音流互不干扰)"""
+        if not _HAS_SD or len(pcm) < 4:
+            return
+        try:
+            if self._out_stream is None:
+                self._out_stream = sd.OutputStream(
+                    samplerate=SR_OUT, channels=1, dtype="int16",
+                )
+                self._out_stream.start()
+            self._out_stream.write(np.frombuffer(pcm, dtype=np.int16))
+        except Exception as e:
+            log(f"[AUDIO] 播放错误: {e}")
+
+    def _stop_playback(self) -> None:
+        """停止播放流 (幂等)"""
+        if self._out_stream is not None:
+            try:
+                self._out_stream.abort()
+            except Exception:
+                try:
+                    self._out_stream.stop()
+                except Exception:
+                    pass
+            try:
+                self._out_stream.close()
+            except Exception:
+                pass
+            self._out_stream = None
+
+    # ==================================================================
+    # WAV 模式
+    # ==================================================================
+
+    async def _wav_mode(self):
+        log(f"[MODE] WAV: {self.wav_file}")
+        pcm, sr = _wav_read(self.wav_file)
+        ms = len(pcm) / (sr * 2) * 1000
+        log(f"[WAV] {len(pcm)} B {sr}Hz {ms:.0f}ms")
+        self.stats.reset()
+
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            if not self.running:
+                break
+            await self._send_audio(pcm[i:i + CHUNK_BYTES])
+            await asyncio.sleep(CHUNK_MS / 1000)
+
+        log("[WAV] 发送完毕 → commit")
+        await self._commit()
+
+    # ==================================================================
+    # 接收
+    # ==================================================================
+
+    async def _recv(self):
+        log("[RECV] 开始")
+        try:
+            async for raw in self.ws:
+                await self._on_msg(raw)
+        except websockets.ConnectionClosed as e:
+            log(f"[RECV] 关闭: {e}")
+            raise
+        except Exception as e:
+            log(f"[RECV] 异常: {e}")
+        log("[RECV] 结束")
+
+    async def _on_msg(self, raw):
+        if isinstance(raw, bytes):
+            raw = raw.decode(errors="replace")
+        try:
+            m = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        t = m.get("type", "")
+
+        if t == "session.updated":
+            log("[<-] session.updated → 就绪")
+
+        elif t == "input_audio_buffer.speech_started":
+            log("[<-] speech_started")
+
+        elif t == "input_audio_buffer.speech_stopped":
+            log("[<-] speech_stopped")
+
+        elif t == "input_audio_buffer.committed":
+            log("[<-] committed → 服务端处理中")
+
+        elif t == "response.output_audio_transcript.delta":
+            d = m.get("delta", "")
+            if self.stats.texts == 0:
+                self.stats.first_token_ms = (time.time() - self.stats.commit_at) * 1000
+                log(f"[LAT] 首Token: {self.stats.first_token_ms:.0f}ms")
+            self.stats.texts += 1
+            sys.stdout.write(f"\r[ASR] {d}")
+            sys.stdout.flush()
+
+        elif t == "response.output_audio.delta":
+            b64 = m.get("delta", "")
+            if not b64:
+                return
+            try:
+                pcm = base64.b64decode(b64)
+            except Exception:
+                return
+            if self.stats.audios == 0:
+                self.stats.first_audio_ms = (time.time() - self.stats.commit_at) * 1000
+                log(f"\n[LAT] 首帧音频: {self.stats.first_audio_ms:.0f}ms")
+            self.stats.audios += 1
+            self.obuf.extend(pcm)
+            if self.stats.audios % 10 == 0:
+                log(f"[AUDIO] {self.stats.audios} 块 ({len(self.obuf)} B)")
+            self._play_pcm(pcm)
+
+        elif t == "response.output_audio.done":
+            log("[<-] audio.done")
+
+        elif t == "response.done":
+            self.stats.total_ms = (time.time() - self.stats.commit_at) * 1000
+            log(f"[<-] response.done → 总轮次: {self.stats.total_ms:.0f}ms")
+
+        elif t == "error":
+            log(f"[<-] ERROR: {m.get('error', {}).get('message', str(m))}")
+
+    # ==================================================================
+    # 发送
+    # ==================================================================
+
+    async def _send_json(self, o):
+        await self.ws.send(json.dumps(o))
+
+    async def _send_audio(self, data):
+        await self._send_json({
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(data).decode(),
+        })
+
+    async def _commit(self):
+        self.stats.commit_at = time.time()
+        await self._send_json({"type": "input_audio_buffer.commit"})
+        log("[SEND] audio.commit")
+
+    async def _interrupt(self):
+        await self._send_json({"type": "response.cancel"})
+        self._stop_playback()  # 只停播放流, 不影响录音流
+        log("[SEND] response.cancel (打断)")
+
+    # ==================================================================
+    # 工具
+    # ==================================================================
+
+    async def _kbd_get(self) -> str:
+        try:
+            return await asyncio.wait_for(self.kbd.input_queue.get(), timeout=0.15)
+        except asyncio.TimeoutError:
+            return ""
+
+    async def _wait(self, timeout):
+        last = self.stats.audios
+        idle = 0
+        waited = 0.0
+        while waited < timeout and self.running:
+            if self.stats.audios != last:
+                last = self.stats.audios; idle = 0
+            else:
+                idle += 1
+            if idle > 20:
+                break
+            await asyncio.sleep(0.15)
+            waited += 0.15
+
+    def _stat(self):
+        print(f"\n===== 延迟 =====")
+        print(f"  首Token: {self.stats.first_token_ms:.0f}ms")
+        print(f"  首帧音频: {self.stats.first_audio_ms:.0f}ms")
+        print(f"  总轮次: {self.stats.total_ms:.0f}ms")
+        print(f"  音频块: {self.stats.audios}")
+        print(f"  输出: {len(self.obuf)} B ({len(self.obuf)/SR_OUT/2:.1f}s)")
+        print(f"================")
 
 
 # =============================================================================
 # 音频工具
 # =============================================================================
 
-def pcm_to_base64(pcm: bytes) -> str:
-    return base64.b64encode(pcm).decode("ascii")
-
-
-def base64_to_pcm(b64: str) -> bytes:
-    return base64.b64decode(b64)
-
-
-def rms(data: bytes) -> float:
-    """计算 PCM 16-bit 数据的 RMS 能量"""
-    if len(data) < 2:
+def _rms(d: bytes) -> float:
+    if len(d) < 2:
         return 0.0
-    samples = np.frombuffer(data, dtype=np.int16).astype(np.float64)
-    return float(np.sqrt(np.mean(samples ** 2)))
+    s = np.frombuffer(d, dtype=np.int16).astype(np.float64)
+    return float(np.sqrt(np.mean(s ** 2)))
 
 
-def read_wav(path: str) -> tuple[bytes, int]:
-    """
-    读取 WAV 文件，返回 (PCM数据, 采样率)。
-
-    对齐固件: 如果不是 16kHz mono 16-bit，自动转换。
-    """
-    with wave.open(path, "rb") as wf:
-        sr = wf.getframerate()
-        ch = wf.getnchannels()
-        sw = wf.getsampwidth()
-        data = wf.readframes(wf.getnframes())
-
-    # 转换为 16kHz mono 16-bit
-    if sr != SAMPLE_RATE_INPUT or ch != 1 or sw != 2:
-        samples = np.frombuffer(data, dtype=np.int16).reshape(-1, ch)
-        if ch > 1:
-            samples = samples.mean(axis=1).astype(np.int16)
-        if sr != SAMPLE_RATE_INPUT:
-            ratio = SAMPLE_RATE_INPUT / sr
-            new_len = int(len(samples) * ratio)
-            samples = np.interp(
-                np.linspace(0, len(samples) - 1, new_len),
-                np.arange(len(samples)), samples,
-            ).astype(np.int16)
-        data = samples.tobytes()
-
-    return data, SAMPLE_RATE_INPUT
+def _wav_read(path: str) -> tuple[bytes, int]:
+    with wave.open(path, "rb") as f:
+        sr = f.getframerate()
+        ch = f.getnchannels()
+        data = f.readframes(f.getnframes())
+    s = np.frombuffer(data, dtype=np.int16)
+    if ch > 1:
+        s = s.reshape(-1, ch).mean(axis=1).astype(np.int16)
+    if sr != SR_IN:
+        ratio = SR_IN / sr
+        nl = int(len(s) * ratio)
+        s = np.interp(np.linspace(0, len(s) - 1, nl), np.arange(len(s)), s).astype(np.int16)
+    return s.tobytes(), SR_IN
 
 
-def write_wav(path: str, data: bytes, sample_rate: int = SAMPLE_RATE_OUTPUT) -> None:
-    """保存 PCM 数据为 WAV 文件"""
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(data)
+def _resample(data: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """PCM 16-bit 线性插值重采样"""
+    if src_rate == dst_rate:
+        return data
+    s = np.frombuffer(data, dtype=np.int16).astype(np.float64)
+    ratio = dst_rate / src_rate
+    nl = int(len(s) * ratio)
+    s = np.interp(np.linspace(0, len(s) - 1, nl), np.arange(len(s)), s)
+    return s.astype(np.int16).tobytes()
 
 
-# =============================================================================
-# 麦克风采集
-# =============================================================================
+def _wav_save(path: str, data: bytes, sr: int):
+    expected_bytes = len(data)
+    expected_frames = expected_bytes // 2
 
-class MicrophoneCapture:
-    """异步麦克风采集器 — 对齐固件端 mic.record() 行为"""
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr)
+        f.writeframes(data)
+        # 强制刷新到磁盘，防止缓冲区数据未写完
+        f._file.flush()
+        os.fsync(f._file.fileno())
 
-    def __init__(self, device_id: Optional[int] = None):
-        self._device = device_id
-        self._stream: Optional[sd.InputStream] = None
-        self._running = False
-
-    async def start(self) -> None:
-        if not _HAS_AUDIO:
-            return
-        self._running = True
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-    async def read_chunk(self) -> Optional[bytes]:
-        """
-        读取一帧音频 (2000 samples, ~125ms)。
-
-        对齐固件: M5.Mic.record(rtRecBuf, rtRecLength, rtRecSamplerate)
-        每次读取 2000 samples，16kHz，16-bit，mono。
-        """
-        if not _HAS_AUDIO or not self._running:
-            return None
-
-        loop = asyncio.get_event_loop()
-        try:
-            data = await loop.run_in_executor(
-                None,
-                lambda: sd.rec(
-                    CHUNK_SAMPLES,
-                    samplerate=SAMPLE_RATE_INPUT,
-                    channels=1,
-                    dtype="int16",
-                    blocking=True,
-                )
-            )
-            return data.tobytes()
-        except Exception:
-            return None
-
-
-# =============================================================================
-# 音频播放
-# =============================================================================
-
-class AudioPlayer:
-    """流式音频播放器 — 支持立即截断"""
-
-    def __init__(self):
-        self._stream: Optional[sd.OutputStream] = None
-        self._playing = False
-
-    def start(self) -> None:
-        """打开播放流"""
-        if not _HAS_AUDIO:
-            return
-        self._stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE_OUTPUT,
-            channels=1,
-            dtype="int16",
-        )
-        self._stream.start()
-        self._playing = True
-
-    def stop(self) -> None:
-        """
-        立即停止播放 (对应打断)。
-
-        对齐固件: 固件端在收到新音频时停止当前播放，
-        调用 M5.Speaker.end() 然后 M5.Mic.begin()。
-        """
-        self._playing = False
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-    def feed(self, pcm_chunk: bytes) -> None:
-        """喂入音频块，立即播放"""
-        if not self._playing or not self._stream:
-            return
-        try:
-            samples = np.frombuffer(pcm_chunk, dtype=np.int16)
-            self._stream.write(samples)
-        except Exception:
-            pass
-
-
-# =============================================================================
-# 键盘输入 (非阻塞)
-# =============================================================================
-
-class KeyboardReader:
-    """
-    非阻塞键盘读取。
-
-    在 Unix 上通过 sys.stdin + asyncio 实现。
-    按 i → 打断，按 q → 退出。
-    """
-
-    def __init__(self):
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
-
-    async def start(self) -> None:
-        """启动键盘监听"""
-        loop = asyncio.get_event_loop()
-
-        if sys.platform == "win32":
-            # Windows: 使用 msvcrt
-            import msvcrt
-            async def _reader():
-                while True:
-                    if msvcrt.kbhit():
-                        ch = msvcrt.getch().decode("utf-8", errors="replace").lower()
-                        await self._queue.put(ch)
-                    await asyncio.sleep(0.05)
+    # 验证磁盘文件完整性 (比对实际文件大小，而非仅读 header)
+    actual_size = os.path.getsize(path)
+    header_size = 44
+    expected_size = header_size + expected_bytes
+    if actual_size != expected_size:
+        print(f"⚠️  WAV 大小不匹配: 期望 {expected_size}B, 磁盘 {actual_size}B (差值 {expected_size - actual_size}B)")
+        # 文件截断 — 重写为实际数据长度
+        print(f"    修复: 按实际数据 {actual_size - header_size}B 重写")
+        actual_data = data[:(actual_size - header_size)] if actual_size > header_size else b""
+        with wave.open(path, "wb") as f:
+            f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr)
+            f.writeframes(actual_data)
+            f._file.flush()
+            os.fsync(f._file.fileno())
+    else:
+        # 双重验证: readframes 确认可读出全部数据
+        with wave.open(path, "rb") as f:
+            readback = f.readframes(expected_frames)
+        if len(readback) != expected_bytes:
+            print(f"⚠️  WAV readframes 不完整: 期望 {expected_bytes}B, 读到 {len(readback)}B")
         else:
-            # Unix: 使用 sys.stdin
-            import termios, tty
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-
-            async def _reader():
-                try:
-                    while True:
-                        ch = await loop.run_in_executor(None, sys.stdin.read, 1)
-                        if ch:
-                            await self._queue.put(ch.lower())
-                finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-        asyncio.create_task(_reader())
-
-    async def get(self) -> str:
-        """获取一个按键 (非阻塞等待)"""
-        try:
-            return await asyncio.wait_for(self._queue.get(), timeout=0.1)
-        except asyncio.TimeoutError:
-            return ""
+            print(f"    WAV 验证通过: 1ch 16bit {sr}Hz {expected_frames} frames ({expected_frames/sr:.2f}s) [{actual_size}B on disk]")
 
 
 # =============================================================================
-# StackChan 模拟客户端
+# 日志
 # =============================================================================
 
-class StackChanClient:
+def log(msg: str):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# =============================================================================
+# main
+# =============================================================================
+
+def _cmd_list_devices():
+    """列出所有输入设备"""
+    if not _HAS_SD:
+        print("sounddevice 未安装")
+        return
+    devs = sd.query_devices()
+    _ALIAS = ("default", "pulse", "pipewire", "combined", "simultaneous", "null")
+    print(f"\n{'#':<4} {'输入':<6} {'名称':<40} {'采样率':<10}  备注")
+    print("-" * 74)
+    for i, d in enumerate(devs):
+        if d['max_input_channels'] > 0:
+            marks = []
+            if i == sd.default.device[0]:
+                marks.append("默认")
+            name_l = d['name'].strip().lower()
+            if any(a in name_l for a in _ALIAS):
+                marks.append("⚠️别名(可能假活)")
+            mark = " ← " + ", ".join(marks) if marks else ""
+            print(f"{i:<4} {d['max_input_channels']:<6} {d['name']:<40} {int(d['default_samplerate']):<10} {mark}")
+
+
+def _cmd_test_mic(mic_device=None, duration: float = 3.0, save_path: Optional[str] = None):
     """
-    StackChan 模拟客户端。
+    测试麦克风: 录制 N 秒 → 播放 → 保存 → 报告统计。
 
-    完全模拟固件端行为，用于:
-      1. 无硬件时调试服务端
-      2. 自动化回归测试 (WAV 模式)
-      3. 延迟性能测量
+    Args:
+        mic_device: None=默认, int=设备索引, str=名称子串
+        duration: 录制时长 (秒)
+        save_path: 保存路径 (None=不保存)
     """
+    if not _HAS_SD:
+        print("❌ sounddevice 未安装。pip install sounddevice")
+        return
 
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 8080,
-        device_id: str = "sim-001",
-        wav_file: Optional[str] = None,
-        save_output: Optional[str] = None,
-        verbose: bool = True,
-    ):
-        self._host = host
-        self._port = port
-        self._device_id = device_id
-        self._wav_file = wav_file
-        self._save_output = save_output
-        self._verbose = verbose
+    # 解析设备 — 与 Client._resolve_mic 一致: 过滤有效输入设备
+    devs = sd.query_devices()
+    input_idxs = [i for i, d in enumerate(devs) if d['max_input_channels'] > 0]
 
-        # 组件
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._mic = MicrophoneCapture()
-        self._player = AudioPlayer()
-        self._keyboard = KeyboardReader()
-        self._stats = LatencyStats()
+    if not input_idxs:
+        print("❌ 系统中没有任何输入设备")
+        return
 
-        # 输出音频累积 (用于保存)
-        self._output_buffer: bytearray = bytearray()
+    def _get_device_rate(di: int) -> int:
+        r = int(devs[di].get('default_samplerate', 0) or 0)
+        return r if r > 0 else 16000
 
-        # 状态
-        self._running = False
-        self._session_ready = False
+    def _valid(di: Optional[int]) -> bool:
+        return di is not None and 0 <= di < len(devs) and devs[di]['max_input_channels'] > 0
 
-    # ------------------------------------------------------------------
-    # 主循环
-    # ------------------------------------------------------------------
+    dev_id = None
+    native_rate = 16000
+    if isinstance(mic_device, int):
+        if _valid(mic_device):
+            dev_id = mic_device
+            native_rate = _get_device_rate(dev_id)
+        else:
+            print(f"⚠️  设备 #{mic_device} 不存在或不是输入设备，使用第一个有效输入设备")
+    elif isinstance(mic_device, str):
+        keyword = mic_device.lower()
+        for i in input_idxs:
+            if keyword in devs[i]['name'].lower():
+                dev_id = i
+                native_rate = _get_device_rate(i)
+                break
+        if dev_id is None:
+            print(f"⚠️  未找到匹配 '{mic_device}' 的输入设备")
+    else:
+        di = sd.default.device[0]
+        if _valid(di):
+            dev_id = di
+            native_rate = _get_device_rate(dev_id)
+        else:
+            print(f"⚠️  默认设备 #{di} 不可用，使用第一个有效输入设备")
 
-    async def run(self) -> None:
-        """运行客户端"""
-        self._running = True
+    # 兜底: 第一个有效输入设备
+    if dev_id is None:
+        dev_id = input_idxs[0]
+        native_rate = _get_device_rate(dev_id)
+    dev_info = devs[dev_id]
+    print(f"\n{'='*50}")
+    print(f"  麦克风测试")
+    print(f"{'='*50}")
+    print(f"  设备: #{dev_id} {dev_info['name']}")
+    print(f"  设备原生采样率: {native_rate} Hz")
+    print(f"  录制时长: {duration} 秒")
+    print(f"  格式: mono, int16")
+    print(f"{'='*50}")
 
-        ws_url = f"ws://{self._host}:{self._port}/v1/realtime?model=gpt-realtime"
-        self._log(f"连接: {ws_url}")
-        self._log(f"设备ID: {self._device_id}")
-        self._log("=" * 56)
-        self._log("按键: i=打断 q=退出")
-        self._log("")
+    # 录制 — 使用设备原生采样率 (全程一维 int16)
+    total_samples = int(native_rate * duration)
+    print(f"\n🔴 录制中 ({duration}s @ {native_rate}Hz)...  对着麦克风说话或制造声音")
+    print(f"   进度: ", end="", flush=True)
 
+    audio = np.zeros(total_samples, dtype=np.int16)
+    chunk = native_rate // 10  # 每 100ms 一块
+    n_chunks = total_samples // chunk
+
+    for i in range(n_chunks):
+        start = i * chunk
+        end = start + chunk
         try:
-            async with websockets.connect(ws_url, ping_interval=20) as ws:
-                self._ws = ws
-
-                # 1. 发送 session.update (固件连接后第一条消息)
-                await self._send_session_update()
-                self._log("[SEND] session.update → 等待 session.updated...")
-
-                # 2. 启动键盘监听
-                await self._keyboard.start()
-
-                # 3. 根据模式启动
-                if self._wav_file:
-                    await self._run_wav_mode()
-                else:
-                    await self._run_mic_mode()
-
-        except websockets.ConnectionClosed as e:
-            self._log(f"连接关闭: {e}")
+            block = sd.rec(chunk, samplerate=native_rate, channels=1,
+                           dtype="int16", device=dev_id, blocking=True)
+            audio[start:end] = block.flatten()
         except Exception as e:
-            self._log(f"错误: {e}")
-        finally:
-            self._running = False
-            self._player.stop()
-            await self._mic.stop()
-
-            # 保存输出音频
-            if self._save_output and self._output_buffer:
-                write_wav(self._save_output, bytes(self._output_buffer))
-                self._log(f"输出音频已保存: {self._save_output} ({len(self._output_buffer)} bytes)")
-
-            self._print_stats()
-
-    # ------------------------------------------------------------------
-    # 麦克风交互模式
-    # ------------------------------------------------------------------
-
-    async def _run_mic_mode(self) -> None:
-        """实时麦克风采集 → 发送 → 接收播放"""
-        self._log("[MODE] 实时麦克风模式")
-        self._log("开始录音 (检测到语音自动发送, 30s 超时静音停止)")
-        self._log("")
-
-        await self._mic.start()
-        self._player.start()
-
-        recording = False
-        silent_chunks = 0
-        max_silent = int(RECORD_TIMEOUT_S * 1000 / CHUNK_DURATION_MS)  # ~240 chunks
-
-        recv_task = asyncio.create_task(self._recv_loop())
-
-        try:
-            while self._running:
-                # 键盘检查
-                key = await self._keyboard.get()
-                if key in ("q", "\x1b"):  # q or ESC
-                    self._running = False
-                    break
-                if key == "i":
-                    await self._send_interrupt()
-
-                # 音频采集
-                chunk = await self._mic.read_chunk()
-                if chunk is None:
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # VAD 检测
-                energy = rms(chunk)
-                if energy > VAD_THRESHOLD:
-                    if not recording:
-                        recording = True
-                        self._stats.reset()
-                        self._log(f"[VAD] 语音开始 (RMS={energy:.0f})")
-                    silent_chunks = 0
-                    await self._send_audio(chunk)
-
-                    # 小延迟模拟实时流
-                    await asyncio.sleep(CHUNK_DURATION_MS / 1000 * 0.8)
-                elif recording:
-                    silent_chunks += 1
-                    await self._send_audio(chunk)
-
-                    if silent_chunks > max_silent:
-                        self._log(f"[VAD] 静音 {RECORD_TIMEOUT_S}s, 提交识别")
-                        await self._commit_audio()
-                        recording = False
-                        silent_chunks = 0
-
-        finally:
-            recv_task.cancel()
-            try:
-                await recv_task
-            except asyncio.CancelledError:
-                pass
-
-    # ------------------------------------------------------------------
-    # WAV 文件模式
-    # ------------------------------------------------------------------
-
-    async def _run_wav_mode(self) -> None:
-        """WAV 文件输入 → 发送 → 接收播放 (自动化测试)"""
-        self._log(f"[MODE] WAV 文件模式: {self._wav_file}")
-
-        pcm_data, sr = read_wav(self._wav_file)
-        total_ms = len(pcm_data) / (sr * 2) * 1000
-        self._log(f"[WAV] {len(pcm_data)} bytes, {sr}Hz, {total_ms:.0f}ms")
-        self._log("")
-
-        self._player.start()
-        self._stats.reset()
-
-        recv_task = asyncio.create_task(self._recv_loop())
-
-        try:
-            # 按 2000 samples 分片发送
-            chunk_size = CHUNK_SAMPLES * 2
-            for i in range(0, len(pcm_data), chunk_size):
-                if not self._running:
-                    break
-
-                chunk = pcm_data[i:i + chunk_size]
-                await self._send_audio(chunk)
-
-                # 模拟实时速率 (可加速)
-                await asyncio.sleep(CHUNK_DURATION_MS / 1000)
-
-            # 提交
-            self._log(f"[WAV] 文件发送完毕, 提交识别")
-            await self._commit_audio()
-
-            # 等待接收完成 (最多 60s)
-            await asyncio.sleep(60)
-
-        finally:
-            recv_task.cancel()
-            try:
-                await recv_task
-            except asyncio.CancelledError:
-                pass
-
-    # ------------------------------------------------------------------
-    # 协议方法
-    # ------------------------------------------------------------------
-
-    async def _send_session_update(self) -> None:
-        """发送 session.update (对齐固件)"""
-        msg = {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "model": "gpt-realtime",
-                "output_modalities": ["audio"],
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": SAMPLE_RATE_INPUT},
-                        "turn_detection": {"type": "semantic_vad"},
-                    },
-                    "output": {
-                        "format": {"type": "audio/pcm", "rate": SAMPLE_RATE_OUTPUT},
-                        "voice": "alloy",
-                    },
-                },
-                "instructions": "You are Stack-chan, a friendly robot assistant.",
-                "tools": [],
-                "tool_choice": "auto",
-                "temperature": 0.8,
-            },
-        }
-        await self._ws.send(json.dumps(msg))
-
-    async def _send_audio(self, pcm: bytes) -> None:
-        """发送音频块"""
-        msg = {
-            "type": "input_audio_buffer.append",
-            "audio": pcm_to_base64(pcm),
-        }
-        await self._ws.send(json.dumps(msg))
-
-    async def _commit_audio(self) -> None:
-        """提交音频缓冲区"""
-        self._stats.commit_time = time.time()
-        msg = {"type": "input_audio_buffer.commit"}
-        await self._ws.send(json.dumps(msg))
-        self._log(f"[SEND] audio.commit (缓冲 {self._stats.commit_time:.3f})")
-
-    async def _send_interrupt(self) -> None:
-        """发送打断"""
-        self._player.stop()
-        msg = {"type": "response.cancel"}
-        await self._ws.send(json.dumps(msg))
-        self._log("[SEND] response.cancel (打断)")
-
-    # ------------------------------------------------------------------
-    # 接收循环
-    # ------------------------------------------------------------------
-
-    async def _recv_loop(self) -> None:
-        """接收服务端消息"""
-        try:
-            async for raw in self._ws:
-                await self._handle_message(raw)
-        except websockets.ConnectionClosed:
-            pass
-
-    async def _handle_message(self, raw: str) -> None:
-        """处理服务端消息"""
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
+            print(f"\n❌ 录制错误 (chunk {i}): {e}")
             return
+        # 实时 RMS
+        r = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+        bar = "█" * min(int(r / 100), 20)
+        print(f"\r   进度: {bar} RMS={r:.0f}  ", end="", flush=True)
 
-        msg_type = msg.get("type", "")
+    print(f"\n✅ 录制完成: {len(audio)} samples ({len(audio)/native_rate:.2f}s)")
 
-        if msg_type == "session.updated":
-            self._session_ready = True
-            self._log("[RECV] session.updated → 会话就绪")
+    # 确保连续内存
+    audio = np.ascontiguousarray(audio)
 
-        elif msg_type == "input_audio_buffer.speech_started":
-            self._log("[RECV] speech_started")
+    # 统计
+    flat = audio.astype(np.float64)
+    rms_total = float(np.sqrt(np.mean(flat ** 2)))
+    peak = int(np.max(np.abs(flat)))
+    peak_ratio = peak / 32767 * 100
+    clipped = int(np.sum(np.abs(flat) >= 32700))
 
-        elif msg_type == "input_audio_buffer.speech_stopped":
-            self._log("[RECV] speech_stopped")
+    print(f"\n{'='*50}")
+    print(f"  录音统计")
+    print(f"{'='*50}")
+    print(f"  RMS (整体):     {rms_total:.0f}")
+    print(f"  峰值:           {peak} / 32767 ({peak_ratio:.1f}%)")
+    print(f"  削波样本数:     {clipped} {'⚠️  信号过强!' if clipped > 10 else ''}")
+    print(f"  静音占比:       {int(np.sum(np.abs(flat) < 200) / len(flat) * 100)}%")
+    wav_bytes = len(audio.tobytes())
+    wav_dur = wav_bytes / (native_rate * 2)
+    print(f"  WAV预估:        {wav_bytes} bytes ({wav_dur:.2f}s)")
+    status = "✅ 正常" if rms_total > 50 and peak_ratio > 1.0 and clipped < 10 else "⚠️  请检查"
+    print(f"  诊断:           {status}")
+    print(f"{'='*50}")
 
-        elif msg_type == "input_audio_buffer.committed":
-            self._log("[RECV] audio.committed → 服务端开始处理")
+    # 保存 WAV (一维 int16 → tobytes 保证连续)
+    raw = audio.tobytes()
+    if save_path:
+        _wav_save(save_path, raw, native_rate)
+        print(f"\n💾 已保存: {save_path}")
+    else:
+        default_path = f"mic_test_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+        _wav_save(default_path, raw, native_rate)
+        print(f"\n💾 自动保存: {default_path}")
 
-        elif msg_type == "response.output_audio_transcript.delta":
-            delta = msg.get("delta", "")
-            if self._stats.text_count == 0:
-                self._stats.first_token_ms = (time.time() - self._stats.commit_time) * 1000
-                self._log(f"[LATENCY] 首Token: {self._stats.first_token_ms:.0f}ms")
-            self._stats.text_count += 1
-            if self._verbose:
-                print(f"\r[ASR] {delta}", end="", flush=True)
+    # 播放 — 先强制释放录音流，消除 PortAudio 状态冲突
+    sd.stop()  # 确保所有录音流已关闭
+    try:
+        print("\n🔊 播放录音...")
+        sd.play(audio, samplerate=native_rate, blocking=True)
+        print("✅ 播放完成")
+    except Exception as e:
+        print(f"⚠️  播放失败: {e}")
+        print(f"   提示: 可手动播放保存的 WAV 文件验证录音")
 
-        elif msg_type == "response.output_audio.delta":
-            b64 = msg.get("delta", "")
-            if not b64:
-                return
-            pcm = base64_to_pcm(b64)
-
-            if self._stats.audio_count == 0:
-                self._stats.first_audio_ms = (time.time() - self._stats.commit_time) * 1000
-                self._log(f"\n[LATENCY] 首帧音频: {self._stats.first_audio_ms:.0f}ms")
-
-            self._stats.audio_count += 1
-            self._output_buffer.extend(pcm)
-
-            if self._verbose:
-                print(f"\r[AUDIO] 块#{self._stats.audio_count} ({len(pcm)} bytes)", end="", flush=True)
-
-            self._player.feed(pcm)
-
-        elif msg_type == "response.output_audio.done":
-            self._log("\n[RECV] audio.done")
-
-        elif msg_type == "response.done":
-            self._stats.total_turn_ms = (time.time() - self._stats.commit_time) * 1000
-            self._log(f"[RECV] response.done")
-            self._log(f"[LATENCY] 总轮次: {self._stats.total_turn_ms:.0f}ms")
-
-        elif msg_type == "error":
-            err = msg.get("error", {})
-            self._log(f"[RECV] ERROR: {err.get('message', str(err))}")
-
-        elif msg_type == "rate_limits.updated":
-            pass  # 忽略
-
-    # ------------------------------------------------------------------
-    # 辅助
-    # ------------------------------------------------------------------
-
-    def _log(self, msg: str) -> None:
-        t = time.strftime("%H:%M:%S")
-        print(f"[{t}] {msg}", flush=True)
-
-    def _print_stats(self) -> None:
-        """打印延迟统计"""
-        print()
-        print("=" * 40)
-        print("  延迟统计")
-        print("=" * 40)
-        print(f"  首Token延迟:  {self._stats.first_token_ms:.0f} ms")
-        print(f"  首帧音频延迟: {self._stats.first_audio_ms:.0f} ms")
-        print(f"  总轮次延迟:   {self._stats.total_turn_ms:.0f} ms")
-        print(f"  文本块数:     {self._stats.text_count}")
-        print(f"  音频块数:     {self._stats.audio_count}")
-        print(f"  输出音频:     {len(self._output_buffer)} bytes "
-              f"({len(self._output_buffer)/SAMPLE_RATE_OUTPUT/2:.1f}s)")
-        print("=" * 40)
-
-
-# =============================================================================
-# CLI 入口
-# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="StackChan 模拟客户端 — 无硬件调试 + 自动化测试",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 实时麦克风交互
-  python tools/stackchan_client.py --host 192.168.1.100 --port 8080
+    ap = argparse.ArgumentParser(description="StackChan Client v4")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--dev", default="sim-001")
+    ap.add_argument("--wav", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--list-devices", action="store_true", help="列出所有输入设备并退出")
+    ap.add_argument("--mic", default=None, help="麦克风设备 (索引号 或 名称子串, 如 'Yeti' 或 '0')")
+    ap.add_argument("--test-mic", type=float, const=3.0, nargs="?", default=None,
+                    help="测试麦克风 (可选时长秒数, 默认 3s)")
+    a = ap.parse_args()
 
-  # WAV 文件测试
-  python tools/stackchan_client.py --wav test_input.wav --save-output out.wav
+    if a.list_devices:
+        _cmd_list_devices()
+        return
 
-  # 静默模式 (仅打印延迟统计)
-  python tools/stackchan_client.py --wav test_input.wav --quiet
+    if a.test_mic is not None:
+        mic = a.mic
+        if mic and mic.isdigit():
+            mic = int(mic)
+        _cmd_test_mic(mic_device=mic, duration=a.test_mic)
+        return
 
-测试建议:
-  1. 准备一段 3-5 秒的 WAV 语音文件 (16kHz mono)
-  2. 运行服务端: python -m stackchan_server.main
-  3. 运行客户端: python tools/stackchan_client.py --wav hello.wav
-  4. 检查输出: 首Token延迟 < 2s, 首帧音频延迟 < 3s
-        """,
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="服务端地址")
-    parser.add_argument("--port", type=int, default=8080, help="服务端端口")
-    parser.add_argument("--device-id", default="sim-001", help="模拟设备 ID")
-    parser.add_argument("--wav", default=None, help="WAV 文件路径 (输入)")
-    parser.add_argument("--save-output", default=None, help="保存接收音频到 WAV 文件")
-    parser.add_argument("--quiet", action="store_true", help="静默模式 (减少日志)")
-    args = parser.parse_args()
+    # mic 参数解析: 纯数字 → int, 否则 str
+    mic = a.mic
+    if mic and mic.isdigit():
+        mic = int(mic)
 
-    client = StackChanClient(
-        host=args.host,
-        port=args.port,
-        device_id=args.device_id,
-        wav_file=args.wav,
-        save_output=args.save_output,
-        verbose=not args.quiet,
-    )
-
-    asyncio.run(client.run())
+    c = Client(host=a.host, port=a.port, dev=a.dev,
+               wav=a.wav, out_wav=a.out, mic_device=mic)
+    try:
+        asyncio.run(c.run())
+    except KeyboardInterrupt:
+        print("\n退出")
 
 
 if __name__ == "__main__":

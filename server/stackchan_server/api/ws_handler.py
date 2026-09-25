@@ -21,7 +21,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Optional
+
+import numpy as np
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request
 
@@ -171,18 +174,47 @@ async def _dispatch(
         # 保存 output_modalities 用于后续决策
         if cfg:
             proto.session_config = cfg
+        # 重连恢复: 重置残留状态机 (上一轮可能停在 LISTENING/REASONING)
+        from ..orchestration.state_machine import ConversationState
+        if session.sm.state != ConversationState.IDLE:
+            slog.info(f"状态机残留 ({session.sm.state.name})，重置为 IDLE")
+            session.sm.reset()
 
     elif event.type == ParsedEventType.AUDIO_APPEND_PCM:
+        # 音频接收统计 (低频日志, 每 10 块或每 2 秒)
+        rx_count = getattr(session, "_audio_rx_count", 0) + 1
+        rx_bytes = getattr(session, "_audio_rx_bytes", 0) + len(event.audio_data)
+        last_log = getattr(session, "_last_audio_rx_log", 0.0)
+        session._audio_rx_count = rx_count
+        session._audio_rx_bytes = rx_bytes
+
+        if rx_count % 10 == 0 or time.time() - last_log > 2.0:
+            try:
+                samples = np.frombuffer(event.audio_data, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+            except Exception:
+                rms = 0.0
+            slog.info(
+                f"AUDIO_RX: 块#{rx_count} 本块={len(event.audio_data)}B "
+                f"累计={rx_bytes}B ({rx_bytes/32:.1f}ms) RMS={rms:.0f} "
+                f"状态={session.sm.state.name}"
+            )
+            session._last_audio_rx_log = time.time()
+
         # 音频追加 → 喂入编排层 + VAD 检测
         if not proto.is_speech_active and proto._detect_speech(event.audio_data):
             proto.is_speech_active = True
             await proto.send_json(build_speech_started())
+            # 仅从 IDLE 进入 LISTENING (to_listening 本身幂等, 防止非法跳转)
+            if session.sm.is_idle:
+                await session.sm.to_listening()
             slog.debug("VAD: 语音开始")
 
         await session.handle_audio_chunk(event.audio_data)
 
     elif event.type == ParsedEventType.AUDIO_COMMIT:
         # 音频提交 → 停止录音 → 触发识别
+        slog.info(f"AUDIO_COMMIT: 开始处理轮次")
         if proto.is_speech_active:
             await proto.send_json(build_speech_stopped())
         proto.is_speech_active = False
@@ -219,6 +251,21 @@ async def _process_turn(
     固件端在此期间可以发送新的音频 (打断) 或 cancel。
     """
     try:
+        # 诊断: 检查引擎状态
+        stt_ok = session._stt and session._stt.state.value < 3  # IDLE or READY or RUNNING
+        llm_ok = session._llm and session._llm.state.value < 3
+        tts_ok = session._tts and session._tts.state.value < 3
+        slog.info(f"AUDIO_PROCESS: stt={stt_ok} llm={llm_ok} tts={tts_ok} text_len={len(session.sm.context.user_text)}")
+
+        if not stt_ok:
+            slog.warning("STT 引擎不可用，无法处理语音")
+            await proto.send_json(build_error_event(
+                "stt_unavailable",
+                "语音识别引擎未就绪。请检查服务器日志。pip install faster-whisper"
+            ))
+            await proto.send_json(build_response_done())
+            return
+
         # 触发 VAD 结束 → 内部调用 STT → LLM → TTS → 发送
         await session.handle_vad_end()
     except asyncio.CancelledError:
@@ -235,21 +282,21 @@ async def _process_turn(
 async def _send_audio_delta(proto: RealtimeSession, data: bytes) -> None:
     """
     音频分片下发。
-
-    固件适配:
-      固件端 streamAudioDelta() 期望收到 base64 编码的 PCM 24kHz 音频。
-      此处将 bytes 编码后通过 WebSocket JSON 文本帧发送。
-      注意: OpenAI 原生 Realtime API 用二进制帧传音频，此处为兼容固件
-            当前实现，使用文本帧 JSON 格式。
     """
     import base64
     b64 = base64.b64encode(data).decode("ascii")
-    await proto.send_json(build_audio_delta(b64))
+    try:
+        await proto.send_json(build_audio_delta(b64))
+    except Exception as e:
+        get_session_logger(proto.session_id).warning(f"音频发送失败: {e}")
 
 
 async def _send_text_delta(proto: RealtimeSession, text: str) -> None:
     """文本增量下发 (转录文本)"""
-    await proto.send_json(build_audio_transcript_delta(text))
+    try:
+        await proto.send_json(build_audio_transcript_delta(text))
+    except Exception:
+        pass
 
 
 async def _log_device_event(slog, evt) -> None:

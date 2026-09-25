@@ -33,7 +33,7 @@ from .state_machine import (
 )
 from ..engines.base import (
     LLMMessage, STTResult, EngineState,
-    EngineError, EngineUnavailableError,
+    EngineError, EngineAuthError, EngineTimeoutError, EngineUnavailableError,
 )
 from ..engines.llm.llm_engine import LLMEngine
 from ..engines.stt.stt_engine import STTEngine
@@ -48,8 +48,9 @@ from ..protocol.messages import (
     build_audio_transcript_delta, build_text_delta,
     build_response_done,
 )
-from ..config import AppConfig, get_config
+from ..config import AppConfig, UtteranceConfig, get_config
 from ..logging_config import get_session_logger
+from ..api.admin import publish_event, AdminEvent
 
 
 # =============================================================================
@@ -347,6 +348,60 @@ class IntentRouter:
 
 
 # =============================================================================
+# 语句评估器 — 断句识别文本是否构成完整语句、是否提交 LLM
+# =============================================================================
+
+class UtteranceEvaluator:
+    """
+    语句评估器。
+
+    职责:
+      判断 STT 断句识别的文本是否构成"完整语句"，决定是否触发 LLM。
+
+      避免两个极端:
+        - 过碎片化: 说话中的自然停顿被切碎, 每个碎片都调 LLM
+        - 过度等待: 用户说完了但迟迟不响应
+
+      评估规则 (按优先级):
+        1. 文本长度 < min_chars → 噪声/碎片, 不提交
+        2. 以句末标点结尾 (。！？!?.;…) → 语句完整, 提交
+        3. 无标点但长度 ≥ submit_min_chars_no_punct → 语义可能完整, 提交
+        4. 长度 ≥ max_pending_chars → 强制提交 (防止无限累积)
+        5. 否则 → 继续累积等待
+    """
+
+    def __init__(self, config: Optional["UtteranceConfig"] = None):
+        if config is None:
+            config = get_config().conversation.utterance
+        self._min_chars = config.min_chars
+        self._submit_punct = set(config.submit_punctuation)
+        self._submit_min_chars_no_punct = config.submit_min_chars_no_punct
+        self._max_pending_chars = config.max_pending_chars
+
+    def evaluate(self, text: str) -> tuple[bool, str]:
+        """
+        评估文本是否应提交 LLM。
+
+        Returns:
+            (是否提交, 原因说明)
+        """
+        text = text.strip()
+        if len(text) < self._min_chars:
+            return False, f"过短({len(text)}字)"
+
+        if text[-1] in self._submit_punct:
+            return True, f"句末标点({text[-1]})"
+
+        if len(text) >= self._submit_min_chars_no_punct:
+            return True, f"长度足够({len(text)}字无标点)"
+
+        if len(text) >= self._max_pending_chars:
+            return True, f"累积上限({len(text)}字)"
+
+        return False, f"语句未完整({len(text)}字, 继续等待)"
+
+
+# =============================================================================
 # 动效编排器
 # =============================================================================
 
@@ -497,6 +552,11 @@ class ConversationSession:
         self._turn_id: int = 0
         self._cancel_event = asyncio.Event()
 
+        # 断句驱动流水线状态
+        self._pending_utterance: str = ""          # 断句识别的累积文本
+        self._evaluator = UtteranceEvaluator()     # 语句评估器
+        self._processing_task: Optional[asyncio.Task] = None  # 当前 LLM 处理任务
+
         # 注册动效回调
         self._setup_animation_callbacks()
 
@@ -575,11 +635,23 @@ class ConversationSession:
         if not self.sm.is_listening:
             return
 
-        # 喂入 STT 引擎
+        # 喂入 STT 引擎 (断句触发时返回整段识别结果)
         if self._stt and self._stt.state == EngineState.READY:
             result = await self._stt.feed(audio_data)
             if result is not None and result.text.strip():
-                self.sm.context.user_text += result.text
+                text = result.text.strip()
+                # 断句识别出文本 → 评估是否构成完整语句
+                submit, reason = self._evaluator.evaluate(text)
+                self._slog.info(f"断句识别: '{text[:50]}' → {reason}")
+
+                if submit:
+                    # 语句完整 → 触发 LLM 流水线 (异步, 不阻塞音频接收)
+                    self._slog.info(f"语句完整, 提交 LLM 理解")
+                    asyncio.create_task(self._safe_process_utterance(text))
+                else:
+                    # 语句未完整 → 累积, 等待下一次断句
+                    self._pending_utterance = text
+                    self.sm.context.user_text = text
 
     async def handle_vad_end(self) -> None:
         """
@@ -643,24 +715,75 @@ class ConversationSession:
 
     async def _commit_audio(self) -> None:
         """
-        提交音频 → STT → 路由 → LLM → TTS → 发送。
+        兜底提交 — 客户端 commit / 触摸停止 / VAD 结束时强制处理剩余音频。
 
-        全链路异常兜底: 每阶段独立 try/except，故障不级联。
-        性能埋点: 记录每阶段耗时，结构化输出。
+        正常路径是断句驱动: handle_audio_chunk 中评估完整 → _process_utterance。
+        此方法兜底处理断句评估未通过的残留文本, 避免用户说完无响应。
+        """
+        user_text = ""
+
+        # 对剩余音频做最终整体识别 (覆盖式)
+        if self._stt and hasattr(self._stt, "finalize"):
+            try:
+                final_result = await self._stt.finalize()
+                if final_result is not None and final_result.text.strip():
+                    user_text = final_result.text.strip()
+            except Exception as e:
+                self._slog.warning(f"STT finalize 失败: {e}")
+
+        # 回退: 断句识别累积但未提交的文本
+        if not user_text:
+            user_text = (
+                self._pending_utterance.strip()
+                or self.sm.context.user_text.strip()
+            )
+
+        self._pending_utterance = ""
+        self.sm.context.user_text = ""
+
+        if not user_text:
+            # 无有效文本: 回 LISTENING 继续听 (连续对话)
+            await self.sm.to_listening()
+            return
+
+        self._slog.info(f"兜底提交: {user_text[:80]}")
+        await self._process_utterance(user_text)
+
+    async def _safe_process_utterance(self, user_text: str) -> None:
+        """
+        语句处理安全包装 — 供 asyncio.create_task 使用。
+
+        内部异常不能穿透 task 边界 (否则 "Task exception was never retrieved"),
+        失败时回 LISTENING 保证会话持续可用。
+        """
+        try:
+            await self._process_utterance(user_text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._slog.error(f"语句处理异常: {type(e).__name__}: {e}")
+            try:
+                await self.sm.to_listening()
+            except Exception:
+                pass
+
+    async def _process_utterance(self, user_text: str) -> None:
+        """
+        完整语句处理流水线: 授权检查 → 意图路由 → LLM → TTS → 回 LISTENING。
+
+        断句驱动 (handle_audio_chunk) 和 commit 兜底 (_commit_audio) 都走此入口。
+        末尾回到 LISTENING 而非 IDLE, 支持连续多轮全双工对话。
+        全链路异常兜底: 每阶段独立 try/except, 故障不级联。
         """
         t0 = time.time()
         metrics = TurnMetrics(turn_id=self._turn_id)
-
-        # ---- STT ----
-        user_text = self.sm.context.user_text.strip()
-        if not user_text:
-            await self.sm.to_idle()
-            return
 
         t_stt = time.time()
         metrics.stt_ms = (t_stt - t0) * 1000
         self._slog.info(f"STT: {user_text[:80]}")
         await self._notify_text_delta(f"[You]: {user_text}")
+        # 发布 ASR 事件到 Admin UI
+        publish_event(AdminEvent(type="asr", text=user_text, speaker="user"))
 
         # ---- 授权检查 ----
         if self.auth.is_waiting:
@@ -671,7 +794,7 @@ class ConversationSession:
             else:
                 self._slog.info("云端授权拒绝，降级到本地")
                 await self._notify_text_delta(" [ローカルモデルを使用します]")
-                await self.sm.to_idle()
+                await self.sm.to_listening()
                 return
 
         # ---- 意图路由 ----
@@ -685,7 +808,7 @@ class ConversationSession:
                 await self._synthesize_and_send(prompt)
             except Exception as e:
                 self._slog.warning(f"授权提示合成失败: {e}")
-            await self.sm.to_idle()
+            await self.sm.to_listening()
             return
 
         model_name = self._resolve_model(intent)
@@ -697,6 +820,12 @@ class ConversationSession:
         self.history.append_user(user_text)
         self.history.begin_assistant()
         msgs = self.history.build_messages()
+
+        # 日志: DeepSeek 请求详情
+        last_user = user_text[:120]
+        self._slog.info(
+            f"[LLM→{model_name}] msgs={len(msgs)} prompt={last_user}"
+        )
 
         t_llm = time.time()
         full_text = ""
@@ -713,9 +842,15 @@ class ConversationSession:
                 full.append(chunk)
                 self.history.extend_assistant(chunk)
                 await self._notify_text_delta(chunk)
+                # 发布 LLM 增量到 Admin UI
+                publish_event(AdminEvent(type="llm", text=chunk, speaker="assistant", model=model_name))
 
             full_text = "".join(full)
             metrics.llm_total_ms = (time.time() - t_llm) * 1000
+            # 日志: LLM 回复
+            self._slog.info(
+                f"[LLM←{model_name}] chunks={len(full)} reply={full_text[:120]}"
+            )
 
         except EngineUnavailableError:
             full_text = self._degradation_text(model_name)
@@ -733,13 +868,13 @@ class ConversationSession:
             full_text = "内部エラーが発生しました。"
             self._slog.error(f"LLM 异常: {e}")
             metrics.error = str(e)[:80]
-        finally:
-            if not full_text.strip():
-                self.history.rollback_assistant()
-                await self._notify_text_delta(f" [Server]: {full_text}")
-                await self._synthesize_and_send(full_text)
-                await self.sm.to_idle()
-                return
+
+        if not full_text.strip():
+            self.history.rollback_assistant()
+            await self._notify_text_delta(f" [Server]: {full_text}")
+            await self._synthesize_and_send(full_text)
+            await self.sm.to_listening()
+            return
 
         self.history.commit_assistant()
         self._slog.info(f"LLM: {full_text[:80]}")
@@ -771,11 +906,14 @@ class ConversationSession:
         # ---- 完成 ----
         await self._emit_audio_done()
         await self._emit_response_done()
-        await self.sm.to_idle()
+        # 回 LISTENING 而非 IDLE: 支持连续多轮全双工对话
+        # (固件端收到 response.done 后会自行切回录音状态)
+        if self.sm.is_speaking:
+            await self.sm.to_listening()
 
         metrics.total_ms = (time.time() - t0) * 1000
         self._slog.info(
-            f"轮次 #{self._turn_id} 完成 | "
+            f"语句 #{self._turn_id} 完成 | "
             f"STT={metrics.stt_ms:.0f}ms "
             f"LLM(first={metrics.llm_first_token_ms:.0f}ms total={metrics.llm_total_ms:.0f}ms) "
             f"TTS(first={metrics.tts_first_frame_ms:.0f}ms total={metrics.tts_total_ms:.0f}ms) "

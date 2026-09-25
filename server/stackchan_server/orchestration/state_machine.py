@@ -43,7 +43,8 @@ TRANSITIONS: dict[ConversationState, set[ConversationState]] = {
     ConversationState.IDLE:        {ConversationState.LISTENING},
     ConversationState.LISTENING:   {ConversationState.REASONING, ConversationState.IDLE},
     ConversationState.REASONING:   {ConversationState.SPEAKING, ConversationState.INTERRUPTED, ConversationState.IDLE},
-    ConversationState.SPEAKING:    {ConversationState.IDLE, ConversationState.INTERRUPTED},
+    # SPEAKING → LISTENING: 断句驱动的连续对话 (回复完毕直接回到收听, 不等 commit)
+    ConversationState.SPEAKING:    {ConversationState.IDLE, ConversationState.INTERRUPTED, ConversationState.LISTENING},
     ConversationState.INTERRUPTED: {ConversationState.LISTENING, ConversationState.IDLE},
 }
 
@@ -219,7 +220,13 @@ class ConversationStateMachine:
     # ------------------------------------------------------------------
 
     async def to_listening(self) -> None:
-        """开始收听 — 从 SPEAKING 进入时自动经过 INTERRUPTED"""
+        """
+        开始收听 — 从 SPEAKING 进入时自动经过 INTERRUPTED。
+
+        幂等: 已在 LISTENING 时直接返回 (重连恢复场景防御)。
+        """
+        if self._state == ConversationState.LISTENING:
+            return
         if self._state == ConversationState.SPEAKING:
             await self.transition_to(ConversationState.INTERRUPTED, is_interrupted=True)
             await self.transition_to(ConversationState.LISTENING)

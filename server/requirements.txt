@@ -23,6 +23,9 @@ numpy>=2.0.0
 # === 可选: 本地语音识别 (STT) ===
 # faster-whisper>=1.0.0        # pip install faster-whisper
 # silero-vad>=5.1              # pip install silero-vad
+# sherpa-onnx>=1.10.15         # SenseVoice 引擎 (pip install sherpa-onnx)
+# modelscope>=1.20.0           # ModelScope 模型下载 (pip install modelscope)
+# onnx>=1.16.0                 # ONNX metadata 修补 (SenseVoice 社区模型必需)
 
 # === 可选: 文本转语音 (TTS) ===
 # edge-tts>=6.1.0              # pip install edge-tts

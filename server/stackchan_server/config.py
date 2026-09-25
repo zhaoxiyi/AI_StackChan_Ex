@@ -75,9 +75,37 @@ class FasterWhisperConfig(BaseModel):
     min_silence_duration_ms: int = 500
 
 
+class CpuSTTConfig(BaseModel):
+    """纯 CPU 内嵌 STT 引擎 (faster-whisper, 累积式整体识别)"""
+    model_size: str = "small"              # tiny/base/small/medium
+    device: str = "auto"                   # auto/cpu/cuda
+    compute_type: str = "auto"             # auto/float16/int8
+    language: Optional[str] = None         # None=自动检测, "zh", "ja", "en"
+    beam_size: int = 5
+    use_vad: bool = True
+    model_source: str = "huggingface"      # huggingface/modelscope/local
+    model_name: str = ""                   # ModelScope ID 或 local 路径
+    silence_break_ms: int = 800            # 静音断句阈值
+    max_audio_ms: int = 15000              # 音频最长累积
+
+
+class SenseVoiceConfig(BaseModel):
+    """SenseVoice 内嵌 STT 引擎 (sherpa-onnx + ModelScope 模型)"""
+    # 模型源: huggingface(官方发布, 推荐) | modelscope(社区) | local(本地路径)
+    model_source: str = "huggingface"
+    model_name: str = "danieldong/sensevoice-small-onnx-quant"
+    use_int8: bool = True                  # True=model.int8.onnx (237MB), False=model.onnx (937MB)
+    num_threads: int = 4                   # onnxruntime 线程数
+    use_itn: bool = True                   # 逆文本归一化
+    silence_break_ms: int = 800            # 静音断句阈值
+    max_audio_ms: int = 15000              # 音频最长累积
+
+
 class STTConfig(BaseModel):
     """STT 总配置"""
-    engine: str = "faster_whisper"         # faster_whisper | openai_whisper
+    engine: str = "sensevoice"             # sensevoice | cpu_stt | faster_whisper | openai_whisper
+    sensevoice: SenseVoiceConfig = Field(default_factory=SenseVoiceConfig)
+    cpu_stt: CpuSTTConfig = Field(default_factory=CpuSTTConfig)
     faster_whisper: FasterWhisperConfig = Field(default_factory=FasterWhisperConfig)
     audio: STTAudioConfig = Field(default_factory=STTAudioConfig)
 
@@ -97,9 +125,17 @@ class OpenAITTSConfig(BaseModel):
     speed: float = 1.0
 
 
+class CpuTTSConfig(BaseModel):
+    """纯 CPU 内嵌 TTS 引擎 (edge-tts)"""
+    voice: str = "zh-CN-XiaoxiaoNeural"   # edge-tts 语音角色
+    rate: str = "+0%"                      # 语速 -20% ~ +20%
+    pitch: str = "+0Hz"                    # 音调 -20Hz ~ +20Hz
+
+
 class TTSConfig(BaseModel):
     """TTS 总配置"""
-    engine: str = "openai_tts"
+    engine: str = "cpu_tts"                # cpu_tts | openai_tts | voicevox
+    cpu_tts: CpuTTSConfig = Field(default_factory=CpuTTSConfig)
     openai_tts: OpenAITTSConfig = Field(default_factory=OpenAITTSConfig)
     audio: TTSAudioConfig = Field(default_factory=TTSAudioConfig)
 
@@ -123,12 +159,25 @@ class HistoryConfig(BaseModel):
     enable_summary: bool = True
 
 
+class UtteranceConfig(BaseModel):
+    """
+    语句评估配置 — 断句识别的文本是否构成完整语句、是否提交 LLM。
+
+    流程: 音频累积 → 静音断句 → STT 识别 → 文本评估 → (完整) → LLM
+    """
+    min_chars: int = 2                    # 最短有效文本 (低于此长度视为噪声/碎片)
+    submit_punctuation: str = "。！？!?.;…"  # 句末标点 = 语句完整 → 立即提交
+    submit_min_chars_no_punct: int = 15   # 无句末标点时累积多少字才提交
+    max_pending_chars: int = 100          # 累积上限, 强制提交
+
+
 class ConversationConfig(BaseModel):
     """对话总配置"""
     system_prompt: str = ""
     turn: TurnConfig = Field(default_factory=TurnConfig)
     interruption: InterruptionConfig = Field(default_factory=InterruptionConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
+    utterance: UtteranceConfig = Field(default_factory=UtteranceConfig)
 
 
 class LoggingConfig(BaseModel):

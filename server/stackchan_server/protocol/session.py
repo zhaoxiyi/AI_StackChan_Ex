@@ -220,11 +220,17 @@ class RealtimeSession:
     # --- 发送方法 ---
 
     async def send_json(self, data: dict) -> None:
-        """发送 JSON 消息"""
-        if self.websocket and self.state not in (SessionState.CLOSED,):
-            try:
-                await self.websocket.send_text(EventSerializer.serialize(data))
-            except Exception as e:
+        """发送 JSON 消息 — 连接断开时静默跳过"""
+        if not self.websocket or self.state in (SessionState.CLOSED, SessionState.CLOSING):
+            return
+        try:
+            # websockets 库: client_state 检查是否还能发送
+            if hasattr(self.websocket, 'client_state') and \
+               str(self.websocket.client_state) != 'OPEN':
+                return
+            await self.websocket.send_text(EventSerializer.serialize(data))
+        except Exception as e:
+            if "close message" not in str(e) and "not connected" not in str(e).lower():
                 self.slog.error(f"发送失败: {e}")
 
     async def send_error(self, error_type: str, message: str) -> None:
