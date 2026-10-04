@@ -29,6 +29,7 @@
 #include <driver/i2s.h>
 #include <soc/i2s_struct.h>      // 直接寄存器修正 (对齐 M5Unified 的 S3 时钟处理)
 #include "RealtimeAEC.h"        // 回声消除 (与主固件同一模块)
+#include <esp_aec.h>            // 官方 esp-sr AEC (对照实验)
 
 // ---- CoreS3 I2S 引脚 (对齐 M5Unified 硬件定义) ----
 #define PIN_I2S_MCK   0
@@ -1085,11 +1086,293 @@ static void cmd_help(void)
 {
     Serial.println("===== CoreS3 Duplex Test =====");
     Serial.println(" h : 全双工验证 (录A→边放A边录B→放B) ★");
+    Serial.println(" a : AEC 对照台架 NLMS vs esp_aec (安静 45s) ★");
+    Serial.println(" b : 同上但仅测 NLMS (esp_aec 崩溃排查用)");
+    Serial.println(" p/q/r : AEC 探针 mode=5/2/0 (逐个试, 崩溃就重启试下一个)");
     Serial.println(" g : 基础读写探测");
     Serial.println(" m : M5Unified tone 基准");
     Serial.println(" i : codec 寄存器回读");
     Serial.println(" ? : 帮助");
     Serial.println("==============================");
+}
+
+// =============================================================================
+// [AECB] 自研 NLMS vs 官方 esp_aec 对照实验 (参考延迟扫描 0~256ms)
+//
+// 目的: 全双工扬声器回声残余是当前最大音频问题。用确定性"类语音"信号
+//       循环回放 + 同步采集, 两套 AEC 并行处理同一批音频, 扫描参考延迟,
+//       对比各自残余 RMS / 衰减(dB)。ESP 显著更优 → 采用方案一替换。
+// 用法: 重新上电后串口输入 'a', 保持环境安静 ~45 秒
+// =============================================================================
+#define AECB_FRAME      256                 // esp_aec 帧长 (16ms @16k)
+#define AECB_BATCH      1280                // 批长 = 4×320 (NLMS) = 5×256 (ESP)
+#define AECB_HIST       16384               // 播放历史环 (1s @16k)
+#define AECB_SIG_SECS   4
+#define AECB_SIG_LEN    (SAMPLE_RATE * AECB_SIG_SECS)
+#define AECB_DSTEP      256                 // 扫描步进 (16ms)
+#define AECB_DMAX       4096                // 扫描上限 (256ms)
+#define AECB_BATCHES    32                  // 每档批数 (2.56s)
+#define AECB_WARMUP     12                  // 每档丢弃批数 (收敛期)
+
+static int16_t*     g_aecb_sig = nullptr;
+static int16_t      g_aecb_hist[AECB_HIST];
+static uint32_t     g_aecb_tx = 0;
+static uint32_t     g_aecb_rx = 0;
+static aec_handle_t g_esp_aec = nullptr;
+static int16_t      g_aecb_txbuf[AECB_BATCH];
+static int16_t      g_aecb_mic[AECB_BATCH];
+static int16_t      g_aecb_micc[AECB_BATCH];
+static int16_t      g_aecb_ref[AECB_BATCH];
+static int16_t      g_aecb_eout[AECB_BATCH];
+static uint32_t     g_aecb_tx_ok = 0;           // 完整写入的批数
+static uint32_t     g_aecb_tx_fail = 0;         // 写入不足的批数
+static uint32_t     g_aecb_rx_ok = 0;           // 完整读取的批数
+static uint32_t     g_aecb_rx_fail = 0;         // 短读批数
+
+/** 生成类语音测试信号 (180Hz 基频 8 谐波 + 音节包络 + 停顿), 一次性生成到 PSRAM */
+static void aecb_gen_signal(void)
+{
+    if (g_aecb_sig) return;
+    g_aecb_sig = (int16_t*)heap_caps_malloc(AECB_SIG_LEN * 2, MALLOC_CAP_SPIRAM);
+    if (!g_aecb_sig) { Serial.println("[AECB] 信号分配失败"); return; }
+    const float PI2 = 6.2831853f;
+    for (int n = 0; n < AECB_SIG_LEN; n++) {
+        float t  = (float)n / (float)SAMPLE_RATE;
+        float f0 = 180.0f + 25.0f * sinf(PI2 * 0.7f * t);
+        float s  = 0.0f;
+        for (int h = 1; h <= 8; h++) s += sinf(PI2 * f0 * (float)h * t) / (float)h;
+        float ph  = fmodf(t, 0.6f);
+        float env = (ph < 0.45f) ? (0.5f - 0.5f * cosf(PI2 * ph / 0.45f)) : 0.0f;
+        g_aecb_sig[n] = (int16_t)(s * env * 4000.0f);
+    }
+    Serial.printf("[AECB] 类语音测试信号 %d 样本 (%.0fs)\n", AECB_SIG_LEN, (float)AECB_SIG_SECS);
+    Serial.flush();
+}
+
+/** 写一批 (1280 帧) 到 TX, 同步记录播放历史 */
+static void aecb_tx_batch(void)
+{
+    for (int i = 0; i < AECB_BATCH; i++) {
+        int16_t v = g_aecb_sig[(g_aecb_tx + i) % AECB_SIG_LEN];
+        g_aecb_txbuf[i] = v;
+        g_aecb_hist[(g_aecb_tx + i) % AECB_HIST] = v;
+    }
+    size_t sent = 0;
+    while (sent < AECB_BATCH) {
+        size_t w = 0;
+        i2s_write(I2S_PORT, g_aecb_txbuf + sent, (AECB_BATCH - sent) * 2, &w, pdMS_TO_TICKS(1000));
+        if (w == 0) break;
+        sent += w / 2;
+    }
+    g_aecb_tx += sent;
+    if (sent >= AECB_BATCH) g_aecb_tx_ok++; else g_aecb_tx_fail++;
+}
+
+/** 读一批 (1280 帧), 循环补读应对短读 */
+static size_t aecb_rx_batch(void)
+{
+    size_t got = 0;
+    uint32_t t0 = millis();
+    while (got < AECB_BATCH) {
+        size_t rr = 0;
+        i2s_read(I2S_PORT, g_aecb_mic + got, (AECB_BATCH - got) * 2, &rr, pdMS_TO_TICKS(500));
+        got += rr / 2;
+        if (rr == 0 && millis() - t0 > 2000) break;
+    }
+    if (got >= AECB_BATCH) g_aecb_rx_ok++; else g_aecb_rx_fail++;
+    return got;
+}
+
+/** [AECB] 主实验: 延迟扫描 + 双 AEC 对比 (需环境安静); use_esp=false 时仅测 NLMS */
+static void cmd_aec_bench(bool use_esp)
+{
+    Serial.println("\n=== [AECB] NLMS vs esp_aec 对照 — 参考延迟扫描 0~256ms ===");
+    Serial.println("[AECB] 请保持安静约 45 秒 (不要说话)");
+    if (g_rate != 16000 || g_ch_fmt != I2S_CHANNEL_FMT_ONLY_RIGHT) {
+        Serial.println("[AECB] 警告: I2S 非 16k mono, 结果可能异常; 建议重新上电后直接运行");
+    }
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setCursor(6, 6);
+    M5.Lcd.println("AEC bench");
+    M5.Lcd.println("keep quiet!");
+
+    // ★ 采用主固件验证过的播放路径 (裸 duplex_i2s_init + 手动补丁在此硬件上始终无声):
+    //   M5.Speaker.begin 安装 (patched: TX+RX 同端口) → patch_rx_path → 直接 i2s_write
+    M5.Speaker.end();
+    i2s_driver_uninstall(I2S_PORT);
+    delay(80);
+    {
+        auto spk_cfg = M5.Speaker.config();
+        spk_cfg.pin_mck = (gpio_num_t)0;      // ES7210 MCLK
+        spk_cfg.sample_rate = 16000;
+        M5.Speaker.config(spk_cfg);
+        if (!M5.Speaker.begin()) { Serial.println("[AECB] Speaker.begin 失败"); return; }
+        delay(50);
+        patch_rx_path(16000);                  // RX 时钟重建 (对齐主固件 fd_patch_rx_path)
+        aw88298_init();                         // 功放重配 (确保 16k 档位 + 音量)
+        Serial.println("[AECB] I2S 经 M5.Speaker 安装 (TX+RX), 直接 i2s_write 播放");
+        delay(50);
+    }
+
+    aecb_gen_signal();
+    if (!g_aecb_sig) return;
+
+    if (use_esp && !g_esp_aec) {
+        Serial.println("[AECB] stage 1: aec_create...");
+        Serial.flush();
+        delay(50);
+        g_esp_aec = aec_create(16000, AECB_FRAME, 1200);
+        Serial.printf("[AECB] stage 2: aec_create ret=%p\n", (void*)g_esp_aec);
+        Serial.flush();
+        if (!g_esp_aec) { Serial.println("[AECB] esp_aec aec_create 失败 (内存?)"); return; }
+    }
+
+    Serial.println("[AECB] stage 3: nlms begin...");
+    Serial.flush();
+    g_aec.begin(nullptr);
+    Serial.println("[AECB] stage 4: nlms ready");
+    g_aecb_tx = 0;
+    g_aecb_rx = 0;
+    g_aecb_tx_ok = g_aecb_tx_fail = 0;
+    g_aecb_rx_ok = g_aecb_rx_fail = 0;
+    memset(g_aecb_hist, 0, sizeof(g_aecb_hist));
+    Serial.println("[AECB] stage 5: prefill TX DMA...");
+    Serial.flush();
+    for (int i = 0; i < 3; i++) aecb_tx_batch();
+    Serial.println("[AECB] stage 6: scan start");
+    Serial.flush();
+
+    float    best_n = 1e9f, best_e = 1e9f;
+    uint32_t best_nd = 0, best_ed = 0;
+
+    for (uint32_t delay = 0; delay <= AECB_DMAX; delay += AECB_DSTEP) {
+        double s_in = 0, s_n = 0, s_e = 0;
+        int used = 0;
+        for (int b = 0; b < AECB_BATCHES; b++) {
+            if ((b & 7) == 0) {
+                Serial.printf("[AECB] scan delay=%ums batch=%d/%d\n",
+                              (unsigned)(delay * 1000 / SAMPLE_RATE), b, AECB_BATCHES);
+                Serial.flush();
+            }
+            aecb_tx_batch();
+            if (aecb_rx_batch() < AECB_BATCH) { Serial.println("[AECB] 采集短读!"); continue; }
+            uint32_t rx_base = g_aecb_rx;
+            g_aecb_rx += AECB_BATCH;
+
+            memcpy(g_aecb_micc, g_aecb_mic, sizeof(g_aecb_mic));
+            for (int i = 0; i < AECB_BATCH; i++) {
+                g_aecb_ref[i] = g_aecb_hist[(rx_base + AECB_HIST + i - delay) % AECB_HIST];
+            }
+            if (b >= AECB_WARMUP) {
+                for (int i = 0; i < AECB_BATCH; i++) s_in += (double)g_aecb_micc[i] * g_aecb_micc[i];
+            }
+            // esp_aec: 每 256 帧
+            if (use_esp) {
+                for (int off = 0; off < AECB_BATCH; off += AECB_FRAME) {
+                    aec_process(g_esp_aec, g_aecb_micc + off, g_aecb_ref + off, g_aecb_eout + off);
+                }
+            }
+            // 自研 NLMS: 每 320 帧
+            for (int off = 0; off < AECB_BATCH; off += 320) {
+                g_aec.pushReference(g_aecb_ref + off, 320, 16000);
+                g_aec.processFrame(g_aecb_mic + off, nullptr);
+            }
+            if (b >= AECB_WARMUP) {
+                for (int i = 0; i < AECB_BATCH; i++) {
+                    s_e += (double)g_aecb_eout[i] * g_aecb_eout[i];
+                    s_n += (double)g_aecb_mic[i] * g_aecb_mic[i];
+                }
+                used++;
+            }
+            vTaskDelay(1);          // 让出 CPU 给 IDLE (防 task WDT)
+        }
+        if (used == 0) continue;
+        double n = (double)used * AECB_BATCH;
+        float in_rms = sqrtf((float)(s_in / n));
+        float n_rms  = sqrtf((float)(s_n / n));
+        float e_rms  = sqrtf((float)(s_e / n));
+        float n_db = 20.0f * log10f((n_rms + 1e-3f) / (in_rms + 1e-3f));
+        float e_db = 20.0f * log10f((e_rms + 1e-3f) / (in_rms + 1e-3f));
+        if (use_esp) {
+            Serial.printf("[AECB] delay=%3ums in=%6.0f | NLMS=%6.0f(%+5.1fdB) | ESP=%6.0f(%+5.1fdB) | tx=%u/%u rx=%u/%u\n",
+                          (unsigned)(delay * 1000 / SAMPLE_RATE), in_rms, n_rms, n_db, e_rms, e_db,
+                          (unsigned)g_aecb_tx_ok, (unsigned)(g_aecb_tx_ok + g_aecb_tx_fail),
+                          (unsigned)g_aecb_rx_ok, (unsigned)(g_aecb_rx_ok + g_aecb_rx_fail));
+        } else {
+            Serial.printf("[AECB] delay=%3ums in=%6.0f | NLMS=%6.0f(%+5.1fdB) | tx=%u/%u rx=%u/%u\n",
+                          (unsigned)(delay * 1000 / SAMPLE_RATE), in_rms, n_rms, n_db,
+                          (unsigned)g_aecb_tx_ok, (unsigned)(g_aecb_tx_ok + g_aecb_tx_fail),
+                          (unsigned)g_aecb_rx_ok, (unsigned)(g_aecb_rx_ok + g_aecb_rx_fail));
+        }
+        if (in_rms > 100.0f && n_db < best_n) { best_n = n_db; best_nd = delay; }
+        if (in_rms > 100.0f && e_db < best_e) { best_e = e_db; best_ed = delay; }
+    }
+    Serial.printf("[AECB] BEST  NLMS: delay=%ums  %.1fdB\n", (unsigned)(best_nd * 1000 / SAMPLE_RATE), best_n);
+    if (best_n > 1e8f) Serial.println("[AECB] (无有效数据: 回声信号太弱, 检查扬声器/音量)");
+    if (use_esp) {
+        Serial.printf("[AECB] BEST  ESP : delay=%ums  %.1fdB\n", (unsigned)(best_ed * 1000 / SAMPLE_RATE), best_e);
+    }
+    Serial.println("[AECB] 完成 — 请把以上 [AECB] 行发回");
+    M5.Lcd.println("done, see log");
+}
+
+/** [PROBE] AEC 初始化探针: 扫描 aec_pro_create 各 mode 与 aec_create 不同 filter */
+static void cmd_aec_probe(void)
+{
+    Serial.println("\n=== [PROBE] AEC 初始化探针 ===");
+    Serial.printf("[PROBE] free int=%u psram=%u dma=%u\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    Serial.flush(); delay(200);
+
+    const int modes[] = {1, 2, 3, 4, 5, 0};
+    for (int i = 0; i < 6; i++) {
+        Serial.printf("[PROBE] aec_pro_create(256,1,%d)...\n", modes[i]);
+        Serial.flush(); delay(100);
+        aec_handle_t h = aec_pro_create(256, 1, modes[i]);
+        Serial.printf("[PROBE] mode=%d ret=%p\n", modes[i], (void*)h);
+        Serial.flush();
+        if (h) aec_destroy(h);
+        delay(200);
+    }
+    const int fls[] = {200, 600, 1200};
+    for (int i = 0; i < 3; i++) {
+        Serial.printf("[PROBE] aec_create(16000,256,%d)...\n", fls[i]);
+        Serial.flush(); delay(100);
+        aec_handle_t h = aec_create(16000, 256, fls[i]);
+        Serial.printf("[PROBE] fl=%d ret=%p\n", fls[i], (void*)h);
+        Serial.flush();
+        if (h) aec_destroy(h);
+        delay(200);
+    }
+    Serial.println("[PROBE] 探针完成");
+}
+
+/** [PROBE1] 单个 pro mode 探针 (崩溃则重启即可, 每次只试一个) */
+static void cmd_aec_probe1(int mode)
+{
+    Serial.printf("\n=== [PROBE1] aec_pro_create(256,1,%d) ===\n", mode);
+    Serial.printf("[PROBE1] free int=%u psram=%u\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    Serial.println("[PROBE1] creating...");
+    Serial.flush(); delay(200);
+    aec_handle_t h = aec_pro_create(256, 1, mode);
+    Serial.printf("[PROBE1] ret=%p\n", (void*)h);
+    Serial.flush();
+    if (h) {
+        static int16_t m[256], r[256], o[256];
+        memset(m, 0, sizeof(m)); memset(r, 0, sizeof(r)); memset(o, 0, sizeof(o));
+        Serial.println("[PROBE1] aec_process test...");
+        Serial.flush();
+        aec_process(h, m, r, o);
+        Serial.println("[PROBE1] aec_process OK");
+        Serial.flush();
+        aec_destroy(h);
+        Serial.println("[PROBE1] destroy OK — 此 mode 可用!");
+    }
+    Serial.println("[PROBE1] 完成");
 }
 
 // =============================================================================
@@ -1114,11 +1397,11 @@ void setup()
     }
 
     es7210_init();
-    aw88298_init();
     if (!duplex_i2s_init()) {
         M5.Lcd.println("I2S duplex init failed");
         while (1) delay(1000);
     }
+    aw88298_init();      // ★ I2S 之后再配功放 (时钟活跃时锁存采样率, 对齐 'h' 验证过的顺序)
 
     M5.Lcd.setTextSize(2);
     M5.Lcd.println("Duplex v3");
@@ -1135,6 +1418,11 @@ void loop()
         switch (c) {
             case 'h': case 'H': cmd_m5_fullduplex(); break;   // ★ 全双工核心验证
             case 'g': case 'G': cmd_m5_duplex_probe(); break;  // 基础读写探测
+            case 'a': case 'A': cmd_aec_bench(true); break;   // ★ AEC 对照 (NLMS+esp)
+            case 'b': case 'B': cmd_aec_bench(false); break;  // 仅 NLMS (esp 崩溃排查)
+            case 'p': case 'P': cmd_aec_probe1(5); break;     // 探针 mode 5 (S3 加速)
+            case 'q': case 'Q': cmd_aec_probe1(2); break;     // 探针 mode 2 (SPIRAM)
+            case 'r': case 'R': cmd_aec_probe1(0); break;     // 探针 mode 0 (mild)
             case 'm': case 'M': cmd_m5_compare(); break;       // M5Unified 基准
             case 'i': case 'I': cmd_inspect(); break;          // 寄存器回读
             case '?': cmd_help(); break;

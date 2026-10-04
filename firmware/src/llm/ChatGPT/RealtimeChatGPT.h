@@ -63,6 +63,12 @@ public:   //本当はprivateにしたいところだがコールバック関数�
     volatile uint32_t fd_stat_try;         // 窗口内待发块命中次数
     volatile uint32_t fd_stat_ok;          // 窗口内 sendTXT 成功次数
     volatile uint32_t fd_stat_fail;        // 窗口内 sendTXT 失败次数
+#ifdef AEC_DIAG
+    // AEC 诊断 (diag 环境): 真实场景 AEC 前/后能量对比
+    double   fd_diag_in2 = 0.0;            // AEC 前平方和
+    double   fd_diag_out2 = 0.0;           // AEC 后平方和
+    uint32_t fd_diag_n = 0;                // 样本数
+#endif
 
     static void fd_audio_task(void* arg);      // 单任务: 交替读/写 (无并发问题)
     size_t _fd_ring_peek(int16_t* out, size_t max_frames);   // 窥视 (不推进 tail)

@@ -147,6 +147,10 @@ class CpuTTSEngine(BaseTTS):
                             self._state = EngineState.CANCELLED
                             return
                         yield pcm[i:i + SLICE]
+                        # ★ 实时节流: 按音频时长推进 (3200B/2=1600 样本 = 100ms @16k)。
+                        #   此前无节流 → 整段瞬间推送 → 固件播放环被满 → 满时丢最旧
+                        #   → 播报跳跃/字间叠加。节流后推送速率=播放速率, 边收边播。
+                        await asyncio.sleep(SLICE / 2 / 16000)
                 except Exception as e:
                     get_session_logger("system").warning(
                         f"[CpuTTS] 句子合成失败: {sentence[:30]}... → {e}"
@@ -175,7 +179,28 @@ class CpuTTSEngine(BaseTTS):
                 mp3_buf.extend(chunk["data"])
         if not mp3_buf:
             return b""
-        return await asyncio.to_thread(self._decode_mp3_to_pcm, bytes(mp3_buf))
+        pcm = await asyncio.to_thread(self._decode_mp3_to_pcm, bytes(mp3_buf))
+        return self._apply_fade(pcm)
+
+    @staticmethod
+    def _apply_fade(pcm: bytes, fade_samples: int = 128) -> bytes:
+        """首尾淡入淡出 (8ms @16k)。
+
+        每句 TTS 独立合成, 首尾波形突变 (0→满幅 / 满幅→截断) 会听成
+        "喷"爆音(尤其片段边界)。淡入淡出后波形连续, 边界无突变。
+        """
+        import array
+
+        n = len(pcm) // 2
+        if n < fade_samples * 2:
+            return pcm
+        a = array.array("h")
+        a.frombytes(pcm[: n * 2])
+        for i in range(fade_samples):
+            g = i / fade_samples
+            a[i] = int(a[i] * g)
+            a[n - 1 - i] = int(a[n - 1 - i] * g)
+        return a.tobytes()
 
     async def cancel(self) -> None:
         """

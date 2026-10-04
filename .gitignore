@@ -13,3 +13,9 @@ server/logs/
 # --- 本地 lib_extra_dirs 软链 (指向 .pio 缓存, 换机器会断) ---
 firmware/libextra/
 firmware/test_duplex/libextra/
+
+# --- CodeWhale 运行时 ---
+.codewhale/
+
+# --- 音频测试产物 ---
+server/tts_check_16k.wav

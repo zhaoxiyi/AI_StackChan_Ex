@@ -165,7 +165,6 @@ static void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 			break;
 		case WStype_TEXT:
 			//Serial.printf("[WSc] get text: %s\n", payload);
-			Serial.printf("[WSc] text size: %d\n", strlen((char*)payload));
 
             error = deserializeJson(p_this->msgDoc, payload);
             if (error) {
@@ -173,7 +172,11 @@ static void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             }
 
             msgType = p_this->msgDoc["type"].as<String>();
-            Serial.printf("[WSc] text type: %s\n", msgType.c_str());
+            // 音频 delta 每片到达 (一句回复 ~100 片), 逐片打印会阻塞 USB CDC →
+            // 不开监视器时拖慢 WebSocket 收包与播放。仅打印非音频事件。
+            if (!msgType.equals("response.output_audio.delta")) {
+                Serial.printf("[WSc] text size: %d type: %s\n", (int)strlen((char*)payload), msgType.c_str());
+            }
 
             if(msgType.equals("session.updated")){
                 Serial.printf("[WSc] payload: %s\n", payload);
@@ -681,7 +684,16 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
 
                     // ---- 完整 20ms 帧: AEC 处理 → 写入上传缓冲 ----
                     bool hs = false;
+#ifdef AEC_DIAG
+                    for (int k = 0; k < AEC_FRAME_SAMPLES; k++)
+                        self->fd_diag_in2 += (double)self->fd_pend_buf[k] * self->fd_pend_buf[k];
+                    self->fd_diag_n += AEC_FRAME_SAMPLES;
+#endif
                     self->fd_aec.processFrame(self->fd_pend_buf, &hs);
+#ifdef AEC_DIAG
+                    for (int k = 0; k < AEC_FRAME_SAMPLES; k++)
+                        self->fd_diag_out2 += (double)self->fd_pend_buf[k] * self->fd_pend_buf[k];
+#endif
                     size_t src = 0;
                     while (src < AEC_FRAME_SAMPLES) {
                         int idx = self->fd_up_idx;
@@ -725,6 +737,18 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
             self->fd_stat_try = 0;
             self->fd_stat_ok = 0;
             self->fd_stat_fail = 0;
+#ifdef AEC_DIAG
+            if (self->fd_diag_n > 0) {
+                float in_rms  = sqrtf((float)(self->fd_diag_in2 / self->fd_diag_n));
+                float out_rms = sqrtf((float)(self->fd_diag_out2 / self->fd_diag_n));
+                Serial.printf("[FD] aec2s: in=%6.0f out=%6.0f atten=%6.1fdB  (in>1000 即播报期回声, 看此时衰减)\n",
+                              in_rms, out_rms,
+                              20.0f * log10f((out_rms + 1e-3f) / (in_rms + 1e-3f)));
+                self->fd_diag_in2 = 0.0;
+                self->fd_diag_out2 = 0.0;
+                self->fd_diag_n = 0;
+            }
+#endif
         }
 
         vTaskDelay(1);      // 让出 CPU (任务在 core1, 不与 WiFi 核竞争)

@@ -61,6 +61,16 @@ class VLLMEngine(BaseLLM):
             "stream": True,
         }
 
+        # 诊断: 记录实际发送的消息序列 (定位"固定回复"问题)
+        try:
+            _lg = get_session_logger("system")
+            _n = len(body["messages"])
+            _lg.info(f"[vLLMreq] msgs={_n} max_tokens={body['max_tokens']} temp={body['temperature']}")
+            for _i, _m in enumerate(body["messages"][-4:], start=max(0, _n - 4)):
+                _lg.info(f"[vLLMreq] #{_i} {_m['role']}: {str(_m['content'])[:60]}")
+        except Exception:
+            pass
+
         try:
             endpoint = f"{self._config.endpoint.rstrip('/')}/chat/completions" if self._config else ""
             async with self._http.stream("POST", endpoint, json=body) as resp:

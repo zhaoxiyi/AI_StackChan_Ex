@@ -412,6 +412,10 @@ void setup()
   cfg.serial_baudrate = 115200;   //M5Unified 0.1.17からデフォルトが0になったため設定
   M5.begin(cfg);
 
+  // USB CDC 发送超时 0: 主机未读串口 (未开监视器) 时缓冲满立即丢弃,
+  // 避免 Serial.printf 阻塞 WebSocket 回调 → 拖慢收包与播放
+  Serial.setTxTimeoutMs(0);
+
   ///// Debug /////
 #if 0
   check_board();

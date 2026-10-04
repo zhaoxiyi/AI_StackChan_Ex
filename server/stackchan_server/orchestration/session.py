@@ -977,6 +977,18 @@ class ConversationSession:
         metrics.stt_ms = (t_stt - t0) * 1000
         self._slog.info(f"STT: {user_text[:80]}")
 
+        # ---- 打断词短路: "停止/别说了"类指令直接确认, 不进入 LLM ----
+        # (否则会被当作普通对话, 且历史里已有重复回复时 LLM 会复读)
+        _stop_words = ("停止", "停下", "别说了", "不要说了", "闭嘴", "安静", "别说话")
+        if len(user_text.strip()) <= 8 and any(w in user_text for w in _stop_words):
+            self._slog.info(f"打断词指令 → 直接停止确认 (不进 LLM): {user_text[:20]}")
+            try:
+                await self._synthesize_and_send("好的，已停止。")
+            except Exception as e:
+                self._slog.warning(f"停止确认合成失败: {e}")
+            await self.sm.to_listening()
+            return
+
         # ---- 回声防护: 与最近回复相似 → 疑似 AEC 残余, 丢弃 ----------------
         if self._looks_like_echo(user_text):
             self._slog.info(f"疑似回声 (与最近回复相似), 丢弃: {user_text[:40]}")
