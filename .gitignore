@@ -1,0 +1,15 @@
+# --- PlatformIO 构建产物 ---
+.pio/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+server/.venv/
+
+# --- 运行日志 (体积大, 不入库) ---
+server/logs/
+
+# --- 本地 lib_extra_dirs 软链 (指向 .pio 缓存, 换机器会断) ---
+firmware/libextra/
+firmware/test_duplex/libextra/

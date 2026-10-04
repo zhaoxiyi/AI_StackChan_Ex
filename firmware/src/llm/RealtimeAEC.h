@@ -24,7 +24,7 @@
 
 // ---- 帧参数 (与 20ms 分片对齐) ----
 #define AEC_FRAME_SAMPLES    (320)     // 20ms @ 16kHz
-#define AEC_FILTER_TAPS      (512)     // 32ms 回声尾 (近场小扬声器足够)
+#define AEC_FILTER_TAPS      (256)     // 16ms 回声尾 (参考已延迟补偿; 短窗减半 CPU, 防 WiFi 核 IDLE 饿死)
 #define AEC_HISTORY_SAMPLES  (AEC_FILTER_TAPS)
 
 /**
@@ -33,7 +33,7 @@
 typedef struct AecConfig {
     float   mu;             // NLMS 步长 (0.01~0.5, 默认 0.1; 越大收敛快但噪声大)
     float   echo_gain;      // 回声补偿增益 (0.5~1.5, 默认 1.0)
-    float   noise_gate;     // 降噪门限 (RMS, 默认 60; 低于此值视为噪声置零)
+    float   noise_gate;     // 降噪门限 (RMS, 默认 30; 低于此值软衰减 /4, 不清零)
     float   vad_threshold;  // VAD 触发能量 (RMS, 默认 200; 对齐服务端阈值)
     int32_t vad_confirm_ms; // VAD 确认时长 (默认 200ms, 防短暂噪音误触发)
     bool    enable;         // AEC 总开关

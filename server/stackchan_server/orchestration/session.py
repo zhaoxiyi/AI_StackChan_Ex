@@ -31,6 +31,7 @@ from typing import Optional
 from .state_machine import (
     ConversationStateMachine, ConversationState, TurnContext,
 )
+from .utterance import UserTextCondenser, CorrectionMemory
 from ..engines.base import (
     LLMMessage, STTResult, EngineState,
     EngineError, EngineAuthError, EngineTimeoutError, EngineUnavailableError,
@@ -46,7 +47,8 @@ from ..devices.commands import (
 from ..protocol.messages import (
     build_audio_delta, build_audio_done,
     build_audio_transcript_delta, build_text_delta,
-    build_response_done,
+    build_response_done, build_audio_buffer_committed,
+    build_speech_stopped,
 )
 from ..config import AppConfig, UtteranceConfig, get_config
 from ..logging_config import get_session_logger
@@ -98,11 +100,15 @@ class ConversationHistory:
       - summarize() 超长自动摘要压缩 (Phase 2)
     """
 
-    def __init__(self, system_prompt: str = "", max_messages: int = 20):
+    def __init__(self, system_prompt: str = "", max_messages: int = 20,
+                 enable_summary: bool = True, summary_budget_chars: int = 350):
         self._system_prompt = system_prompt
         self._max_messages = max_messages
+        self._enable_summary = enable_summary
+        self._summary_budget = max(80, summary_budget_chars)
         self._messages: list[LLMMessage] = []
         self._pending_assistant: Optional[LLMMessage] = None  # 正在生成中的助手消息
+        self._correction_suffix: str = ""   # 更正记忆注入文本 (追加到 system prompt)
 
     # --- 增删 ---
 
@@ -142,21 +148,108 @@ class ConversationHistory:
         self._pending_assistant = None
         return text
 
+    def keep_interrupted_assistant(self) -> str:
+        """
+        打断时保留部分回复为上下文 (不丢弃)。
+
+        设计: 用户打断时, LLM 已生成的部分文本仍有语义价值
+        (它反映了助手对上一问题的理解), 保留为 assistant 消息
+        并标注"(被打断)", 供下一轮 LLM 参考 — 兼顾上下文
+        连续性与 token 经济性 (只保留纯文本, 无重复生成)。
+
+        Returns:
+            保留的文本 (空串表示无内容可保留)
+        """
+        text = self._pending_assistant.content if self._pending_assistant else ""
+        text = text.strip()
+        if text:
+            self._messages.append(LLMMessage(
+                role="assistant",
+                content=text + " (被打断)",
+            ))
+        self._pending_assistant = None
+        self._maybe_truncate()
+        return text
+
+    def last_user_text(self) -> str:
+        """最后一条已入历史的用户文本 (用于跨轮重复检测)"""
+        for m in reversed(self._messages):
+            if m.role == "user":
+                return m.content
+        return ""
+
+    def set_correction_suffix(self, suffix: str) -> None:
+        """设置追加到 system prompt 的更正信息 (CorrectionMemory 生成)"""
+        self._correction_suffix = (suffix or "").strip()
+
     # --- 查询 ---
 
-    def build_messages(self) -> list[LLMMessage]:
+    def build_messages(self, max_chars: int = 0) -> list[LLMMessage]:
         """
-        构建发送给 LLM 的完整消息列表。
+        构建发送给 LLM 的完整消息列表 (含字符预算控制)。
 
-        固件适配:
-          固件端在 session.update 中携带 instructions (角色 + 用户信息)，
-          此处将 system prompt 放在首位，后面跟历史消息。
+        Context 限制策略:
+          1. 消息数限制: _maybe_truncate 保留最近 max_messages 条
+          2. 字符预算: 从最近的消息往前累计, 超出 max_chars 的更旧消息
+             不硬丢弃 — 拼成一段摘要 (更早对话摘要) 追加到 system prompt,
+             保持上下文连续性同时控制输入长度
+             (中英文按字符数粗估 token: 中文≈1字/1token, 英文≈4字符/1token,
+              预算取 2/3 上下文窗口即可同时保证连贯与低压力)
+          3. 更正记忆: 用户更正记录注入 system prompt, 每轮可见
+          system prompt 永远保留。
+
+        Args:
+            max_chars: 历史消息字符预算, 0 = 不限制
         """
-        msgs = [LLMMessage(role="system", content=self._system_prompt)]
+        system_msg = LLMMessage(role="system", content=self._system_prompt)
+        if self._correction_suffix:
+            system_msg.content = f"{self._system_prompt}\n\n{self._correction_suffix}"
+        msgs = [system_msg]
         msgs.extend(self._messages)
         if self._pending_assistant:
             msgs.append(self._pending_assistant)
-        return msgs
+
+        if max_chars <= 0:
+            return msgs
+
+        # 从最近开始保留, 直到字符预算用尽 (至少保留最近一条)
+        total = len(system_msg.content)
+        kept_recent: list[LLMMessage] = []
+        dropped: list[LLMMessage] = []
+        for m in reversed(msgs[1:]):           # 跳过 system
+            c = len(m.content)
+            if kept_recent and total + c > max_chars:
+                dropped.append(m)
+                continue
+            total += c
+            kept_recent.append(m)
+        kept_recent.reverse()
+        dropped.reverse()                      # 恢复时间正序
+
+        # 被预算挤出的旧消息 → 生成摘要保留, 不硬丢弃
+        summary = self._build_dropped_summary(dropped)
+        if summary:
+            system_msg.content += f"\n\n{summary}"
+        return [system_msg] + kept_recent
+
+    def _build_dropped_summary(self, dropped: list[LLMMessage]) -> str:
+        """把被字符预算挤出的旧消息拼成简短摘要 (纯规则, 无 LLM 成本)"""
+        if not dropped or not self._enable_summary:
+            return ""
+        parts: list[str] = []
+        used = 0
+        for m in dropped:
+            s = m.content.strip()
+            if not s:
+                continue
+            seg = f"{m.role}: {s}"[:60]        # 每条截断 60 字符
+            if parts and used + len(seg) > self._summary_budget:
+                break
+            parts.append(seg)
+            used += len(seg)
+        if not parts:
+            return ""
+        return "[更早对话摘要] " + " | ".join(parts)
 
     def last_assistant_text(self) -> str:
         """获取最后一轮助手回复 (用于降级时重新合成)"""
@@ -237,8 +330,8 @@ class AuthorizationManager:
         """
         self._pending_intent = intent
         return (
-            "この機能はDeepSeekのクラウドAPIを使用します。"
-            "よろしいですか？「はい」または「いいえ」でお答えください。"
+            "这个功能需要调用云端API服务，可以吗？"
+            "请回答「可以」或「不可以」。"
         )
 
     def handle_response(self, user_text: str) -> bool:
@@ -252,11 +345,13 @@ class AuthorizationManager:
         if self._pending_intent is None:
             return False
 
-        # 固件适配: 日语/中文/英语 确认词
-        affirm = {"はい", "はい。", "はい！", "いいよ", "いいです", "ok", "yes", "好的", "可以", "行", "嗯", "好"}
-        deny = {"いいえ", "no", "だめ", "不行", "不要", "不可以", "算了"}
+        # 固件适配: 中文/日语/英语 确认词 (去标点后精确匹配)
+        affirm = {"はい", "いいよ", "いいです", "ok", "yes",
+                  "好的", "好", "可以", "可以的", "行", "嗯", "嗯嗯",
+                  "是的", "对", "要"}
+        deny = {"いいえ", "no", "だめ", "不行", "不要", "不可以", "算了", "不用"}
 
-        text = user_text.strip().lower()
+        text = user_text.strip().lower().rstrip("。！？!?.,，、 ")
         if text in {a.lower() for a in affirm}:
             intent = self._pending_intent
             self._pending_intent = None
@@ -296,11 +391,11 @@ class IntentRouter:
       - web:      需要联网搜索 → DeepSeek 云 (需授权)
     """
 
-    # 触发 DeepSeek 的关键词
+    # 触发 DeepSeek 的关键词 (注: "查一下" 已移除 — 会误匹配 "检查一下")
     _COMPLEX_KEYWORDS: set[str] = {
         "帮我写", "写代码", "编程", "解释一下", "详细", "翻译",
         "分析", "总结", "比较", "推荐", "计算", "为什么", "怎么做",
-        "教我", "帮我看看", "帮我找", "搜一下", "查一下",
+        "教我", "帮我看看", "帮我找", "搜一下",
     }
 
     def route(self, user_text: str) -> str:
@@ -388,6 +483,16 @@ class UtteranceEvaluator:
         text = text.strip()
         if len(text) < self._min_chars:
             return False, f"过短({len(text)}字)"
+
+        # ---- 回声/噪声过滤: 纯英文短词 ----
+        # 中文对话场景下, TTS 播放声被麦克风采集后常被误识别为
+        # "Yeah." / "Okay." / "So." 等纯英文短词, 形成回声循环。
+        # 此类文本 (纯 ASCII 字母+标点, < 15 字符) 直接丢弃。
+        if len(text) < 15 and all(
+            (c.isascii() and (c.isalpha() or c.isspace() or c in ".,!?'\""))
+            for c in text
+        ) and any(c.isalpha() for c in text):
+            return False, f"疑似回声/噪声 (纯英文短词 '{text}')"
 
         if text[-1] in self._submit_punct:
             return True, f"句末标点({text[-1]})"
@@ -524,6 +629,14 @@ class ConversationSession:
         self.history = ConversationHistory(
             system_prompt=self._cfg.conversation.system_prompt,
             max_messages=self._cfg.conversation.history.max_messages,
+            enable_summary=self._cfg.conversation.history.enable_summary,
+            summary_budget_chars=self._cfg.conversation.history.summary_budget_chars,
+        )
+
+        # STT 文本精简器 + 更正记忆 (上下文保持)
+        self._condenser = UserTextCondenser()
+        self._corrections = CorrectionMemory(
+            max_entries=self._cfg.conversation.history.corrections_max
         )
 
         # 意图路由 + 授权
@@ -556,6 +669,12 @@ class ConversationSession:
         self._pending_utterance: str = ""          # 断句识别的累积文本
         self._evaluator = UtteranceEvaluator()     # 语句评估器
         self._processing_task: Optional[asyncio.Task] = None  # 当前 LLM 处理任务
+        self._interrupt_grace_until: float = 0.0   # 打断宽限期 (committed 后的残留音频不判打断)
+        self._audio_started: bool = False          # 本轮是否已开始下发音频 (首次分片重置宽限)
+        self._speaking_last_audio_ts: float = 0.0  # 最近一次下发音频分片的时刻 (播放期不判打断)
+        self._last_reply_text: str = ""            # 最近一次回复全文 (回声检测)
+        self._last_reply_ts: float = 0.0           # 最近回复时间戳
+        self._interrupt_hits: int = 0              # 全双工打断: 连续超 RMS 阈值块计数
 
         # 注册动效回调
         self._setup_animation_callbacks()
@@ -626,13 +745,39 @@ class ConversationSession:
           固件端通过 input_audio_buffer.append 发送音频分片。
           此处同时作为打断信号检测: 在 REASONING/SPEAKING 状态收到音频 = 用户打断。
         """
-        # 打断检测
-        if self.sm.is_reasoning or self.sm.is_speaking:
+        # ---- 打断检测 (分状态处理) ----
+        # SPEAKING: 全双工固件边播边听 (AEC 后音频持续上传) —
+        #   宽限期外的真实用户语音 = 打断; 残余回声由 RMS 阈值
+        #   + 连续块确认过滤。半双工固件此期间无上行, 不影响。
+        if self.sm.is_speaking:
+            # 播放期间不判打断: 回声与用户语音 RMS 无法区分 (实测回声 8000+),
+            # 但回声只存在于播放时 — 以"最近下发音频"为闸门, 停发 1s 后才放行打断
+            if self._cfg.conversation.interruption.enabled \
+                    and time.time() >= self._interrupt_grace_until \
+                    and time.time() - self._speaking_last_audio_ts >= 1.0 \
+                    and self._voice_activity(audio_data):
+                self._slog.info("SPEAKING 期间检测到用户语音 → 打断 (全双工)")
+                self._interrupt_hits = 0
+                await self.handle_interrupt()
+            return
+
+        # REASONING: committed 后的残留音频在宽限期内忽略;
+        #   宽限期外的"真实语音"才是打断 — 必须 VAD 确认
+        #   (全双工固件持续上传音频流, 底噪/环境音不应触发打断)
+        if self.sm.is_reasoning \
+                and time.time() >= self._interrupt_grace_until \
+                and self._voice_activity(audio_data):
             self._slog.info("检测到用户打断")
+            self._interrupt_hits = 0
             await self.handle_interrupt()
             return
 
         if not self.sm.is_listening:
+            return
+
+        # 打断/committed 宽限期内: 固件播放环尾音与 AEC 残余回流,
+        # 不喂 STT — 否则回声被识别成用户输入, LLM 自问自答 (重复播报)
+        if time.time() < self._interrupt_grace_until:
             return
 
         # 喂入 STT 引擎 (断句触发时返回整段识别结果)
@@ -652,6 +797,50 @@ class ConversationSession:
                     # 语句未完整 → 累积, 等待下一次断句
                     self._pending_utterance = text
                     self.sm.context.user_text = text
+
+    def _looks_like_echo(self, text: str) -> bool:
+        """
+        判定输入是否疑似"最近回复的回声"。
+
+        全双工扬声器播放期间, AEC 残余可能被静音断句切成短片段
+        (如回复"…音量或者音效吗?"回声识别为"效吗?"), 若与最近
+        10 秒内回复的文本存在包含/高相似关系, 视为回声丢弃。
+        """
+        reply = self._last_reply_text or ""
+        t = (text or "").strip()
+        if not reply or not t:
+            return False
+        if time.time() - self._last_reply_ts > 10.0:
+            return False
+        if len(t) > 12:                        # 回声片段通常短 (被断句截断)
+            return False
+        if t in reply:
+            return True
+        clean = t.rstrip("。！？!?~～ 、，,")
+        return bool(clean) and clean in reply
+
+    def _voice_activity(self, audio_data: bytes) -> bool:
+        """
+        全双工打断 VAD: RMS 阈值 + 连续块确认。
+
+        固件 AEC 后上传的音频中, 残余回声 RMS 低 (噪声门限已清零大部分),
+        用户真实语音 RMS 高 (阈值默认 400, 室内语音典型 300-2000)。
+        连续 N 块超阈值才判定, 过滤短促噪声与 AEC 未收敛时的回声尖峰。
+        """
+        import array
+        n = len(audio_data) // 2
+        if n < 16:
+            return False
+        samples = array.array("h")
+        samples.frombytes(audio_data[:n * 2])
+        rms = (sum(s * s for s in samples) / n) ** 0.5
+
+        thr = self._cfg.conversation.interruption.speech_rms_threshold
+        if rms >= thr:
+            self._interrupt_hits += 1
+        else:
+            self._interrupt_hits = 0
+        return self._interrupt_hits >= self._cfg.conversation.interruption.speech_confirm_blocks
 
     async def handle_vad_end(self) -> None:
         """
@@ -688,14 +877,20 @@ class ConversationSession:
         if self._stt:
             await self._stt.reset()
 
-        # 回滚历史
-        rolled_back = self.history.rollback_assistant()
-        if rolled_back:
-            self._slog.info(f"回滚助手回复: {rolled_back[:50]}...")
+        # 保留被打断的部分回复为上下文 (不丢弃)
+        kept = self.history.keep_interrupted_assistant()
+        if kept:
+            self._slog.info(f"打断: 部分回复保留为上下文: {kept[:50]}...")
 
         # 状态跳转
         await self.sm.interrupt()
         self._cancel_event.clear()
+        # 打断后宽限期: 固件播放环内尾音 (最多 1s) 仍会回流, 期间不喂 STT / 不判打断
+        self._interrupt_grace_until = time.time() + 2.5
+        # 通知固件回到录音状态: 固件依赖 response.done 执行
+        # Speaker→Mic 切换并重新 startRealtimeRecord
+        await self._emit_audio_done()
+        await self._emit_response_done()
 
     # ------------------------------------------------------------------
     # 完整轮次处理
@@ -781,6 +976,56 @@ class ConversationSession:
         t_stt = time.time()
         metrics.stt_ms = (t_stt - t0) * 1000
         self._slog.info(f"STT: {user_text[:80]}")
+
+        # ---- 回声防护: 与最近回复相似 → 疑似 AEC 残余, 丢弃 ----------------
+        if self._looks_like_echo(user_text):
+            self._slog.info(f"疑似回声 (与最近回复相似), 丢弃: {user_text[:40]}")
+            # 发 committed 让固件清空播放环 (音源立即停止) 后回 LISTENING
+            if self._protocol_session:
+                await self._protocol_session.send_json(build_speech_stopped())
+                await self._protocol_session.send_json(build_audio_buffer_committed())
+            await self._emit_audio_done()
+            await self._emit_response_done()
+            await self.sm.to_listening()
+            return
+
+        # ---- STT 文本精简: 抛弃重复内容/口语填充词, 保留语义 ----------------
+        if self._cfg.conversation.history.enable_condense:
+            condensed = self._condenser.condense(user_text)
+            if condensed and condensed != user_text:
+                self._slog.info(f"输入精简: '{user_text[:60]}' → '{condensed[:60]}'")
+                user_text = condensed
+
+        # ---- 更正记忆: 提取并记录用户更正, 保持后续对话正确方向 ------------
+        correction = self._corrections.extract(user_text)
+        if correction:
+            self._corrections.record(correction["old"], correction["new"])
+            self.history.set_correction_suffix(self._corrections.to_system_suffix())
+            self._slog.info(
+                f"记录更正: '{correction['old']}' → '{correction['new']}' "
+                f"(累计 {self._corrections.count} 条)"
+            )
+
+        # ---- 跨轮重复检测: 短时间内与上一轮重复 → 跳过 LLM --------------
+        # 时间窗 (10s): 窗口内重复视为回声/口误而跳过;
+        # 超过窗口的重复是用户有意重问, 正常回复 (此前无时间窗, 重问被静默吞掉)
+        _now_ts = time.time()
+        _repeat_window = 10.0
+        _is_dup = self._cfg.conversation.history.enable_condense and \
+                self._condenser.is_duplicate(user_text, self.history.last_user_text())
+        _last_ts = getattr(self, "_last_user_utter_ts", None)
+        self._last_user_utter_ts = _now_ts
+        if _is_dup and _last_ts is not None and (_now_ts - _last_ts) < _repeat_window:
+            self._slog.info(f"与上一轮重复, 跳过 LLM: {user_text[:50]}")
+            # 停录音回 LISTENING (否则固件一直录到超时)
+            if self._protocol_session:
+                await self._protocol_session.send_json(build_speech_stopped())
+                await self._protocol_session.send_json(build_audio_buffer_committed())
+            await self._emit_audio_done()
+            await self._emit_response_done()
+            await self.sm.to_listening()
+            return
+
         await self._notify_text_delta(f"[You]: {user_text}")
         # 发布 ASR 事件到 Admin UI
         publish_event(AdminEvent(type="asr", text=user_text, speaker="user"))
@@ -815,11 +1060,26 @@ class ConversationSession:
         self.sm.context.model_used = model_name
         metrics.model_used = model_name
 
+        # ---- 通知固件停止录音 (半双工闭环) ----
+        # 固件收到 committed 后: stopRealtimeRecord + Mic→Speaker 切换,
+        # 推理/播放期间不再上传音频, 避免回声循环和误打断。
+        # 固件收到 response.done 后会自动恢复录音。
+        if self._protocol_session:
+            await self._protocol_session.send_json(build_speech_stopped())
+            await self._protocol_session.send_json(build_audio_buffer_committed())
+            self._slog.info("已发送 committed → 固件停止录音")
+            # 打断宽限期: 固件收到 committed 前已发出的残留音频
+            # 会在接下来 1-2 秒内到达, 这些不是用户打断, 忽略之
+            self._interrupt_grace_until = time.time() + 2.0
+            self._audio_started = False
+
         # ---- LLM (兜底: 网络/认证/余额异常均不崩溃) ----
         await self.sm.to_reasoning(user_text)
         self.history.append_user(user_text)
         self.history.begin_assistant()
-        msgs = self.history.build_messages()
+        # Context 字符预算 (控制 vLLM 压力)
+        max_ctx = self._cfg.conversation.history.max_context_chars
+        msgs = self.history.build_messages(max_chars=max_ctx)
 
         # 日志: DeepSeek 请求详情
         last_user = user_text[:120]
@@ -876,8 +1136,48 @@ class ConversationSession:
             await self.sm.to_listening()
             return
 
+        # ---- 竞态防护: LLM 完成时若已被打断 (状态被切走) ----
+        # 断句驱动下 REASONING 期间的真实打断会切走状态。
+        # 部分回复不丢弃, 保留为 Context 供下一轮参考:
+        #   keep_interrupted_assistant 把已生成的文本存入历史
+        #   (标注"(被打断)"), 兼顾上下文连续性与 token 经济。
+        if self._cancel_event.is_set() or not self.sm.is_reasoning:
+            kept = self.history.keep_interrupted_assistant()
+            self._slog.info(
+                f"LLM 完成时已被打断, 部分回复保留为上下文: "
+                f"{kept[:60] if kept else '(空)'}"
+            )
+            # 发 response.done 让固件回录音状态 (否则固件卡在 Speaker)
+            await self._emit_audio_done()
+            await self._emit_response_done()
+            return
+
+        # ---- 剥离 qwen3 思考块 <think>...</think> ----
+        # qwen3 典型输出: <think>推理</think>\n正文 (闭合标签在中间, 不在文末)
+        # 兼容多种形态:
+        #   1. 成对块 (可多个):  <think>..</think> 连同内容整体移除
+        #   2. 未闭合标签:       <think>正文.. (量化模型常见: 不写闭合标签,
+        #                        此时内容就是正文) — 只剥标签, 保留内容
+        #   3. 孤立闭合标签:     </think> (无开头的残留)
+        #   4. 带属性标签:       <think reasoning_effort="low">
+        import re as _re
+        full_text = _re.sub(r"<think\b[^>]*>.*?</think>", "", full_text, flags=_re.DOTALL)
+        full_text = _re.sub(r"<think\b[^>]*>", "", full_text)
+        full_text = _re.sub(r"</think>", "", full_text)
+        full_text = full_text.strip()
+        if not full_text:
+            self.history.rollback_assistant()
+            self._slog.info("LLM 回复仅含思考块, 丢弃")
+            # 发 response.done 让固件回录音状态 (否则固件卡在 Speaker 等音频)
+            await self._emit_audio_done()
+            await self._emit_response_done()
+            await self.sm.to_listening()
+            return
+
         self.history.commit_assistant()
         self._slog.info(f"LLM: {full_text[:80]}")
+        self._last_reply_text = full_text          # 记录回复全文 (回声检测用)
+        self._last_reply_ts = time.time()
 
         # ---- TTS (兜底: 合成失败不阻塞，仅发文本) ----
         await self.sm.to_speaking(full_text)
@@ -939,6 +1239,12 @@ class ConversationSession:
     async def _emit_audio_chunk(self, data: bytes) -> None:
         """协议层: 发送音频分片"""
         if self._protocol_session:
+            # 首次分片: 重置打断宽限期 — AEC 未收敛期的扬音器回声
+            # RMS 很高 (实测 7000+), 会被 VAD 误判为用户打断导致回复被截断
+            if not self._audio_started:
+                self._audio_started = True
+                self._interrupt_grace_until = time.time() + 2.5
+            self._speaking_last_audio_ts = time.time()   # 播放期打断闸门
             b64 = base64.b64encode(data).decode("ascii")
             ps = self._protocol_session
             await ps.send_json(build_audio_delta(b64))

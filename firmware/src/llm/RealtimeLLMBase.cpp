@@ -70,6 +70,29 @@ RealtimeLLMBase::RealtimeLLMBase(llm_param_t param) :
 void RealtimeLLMBase::webSocketProcess()
 {
     webSocket.loop();
+    onWsTick();
+
+#ifdef REALTIME_FULL_DUPLEX
+    // 全双工: 采集上传由 RealtimeAudioStream 采集任务负责,
+    // 本循环只做超时与显示状态维护
+    if(realtime_recording){
+        checkRealtimeRecordTimeout();
+        avatar.setSpeechText(speaking ? "" : "Listening...");
+        delay(1);
+    }
+    else{
+        if(speaking){
+            avatar.setSpeechText("");
+            resetRealtimeRecordStartTime();
+            delay(1);
+        }
+        else{
+            avatar.setSpeechText("Please touch");
+            delay(10);
+        }
+    }
+    return;
+#endif
 
 #ifdef REALTIME_API_WITH_TTS
     if(response_done && !speaking){
@@ -136,6 +159,7 @@ void RealtimeLLMBase::startRealtimeRecord()
         Serial.println("Start realtime recording");
         realtime_recording = true;
         startTime = xTaskGetTickCount();
+        onRecordingStart();
     }
 }
 
@@ -145,6 +169,7 @@ void RealtimeLLMBase::stopRealtimeRecord()
         Serial.println("Stop realtime recording");
         realtime_recording = false;
         startTime = 0;
+        onRecordingStop();
     }
 }
 
@@ -224,7 +249,7 @@ void RealtimeLLMBase::streamAudioDelta(String& delta)
     Serial.printf("audio pcm16 size: %d byte\n", len);
 
     while (M5.Speaker.isPlaying()) { vTaskDelay(1); }
-    M5.Speaker.playRaw((int16_t*)buf, len/2, 24000, false);
+    M5.Speaker.playRaw((int16_t*)buf, len/2, 16000, false);   // 服务端 TTS 输出 16kHz
     nextBufIdx ^= 1;  //ダブルバッファを切り替え
 }
 

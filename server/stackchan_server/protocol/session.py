@@ -91,6 +91,9 @@ class RealtimeSession:
     # 事件处理器注册表
     _handlers: dict[ParsedEventType, EventHandler] = field(default_factory=dict, repr=False)
 
+    # 发送串行锁 (防并发 send 交错消息帧)
+    _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
     # 日志
     _logger: "loguru.Logger" = field(default=None, repr=False)
 
@@ -220,18 +223,27 @@ class RealtimeSession:
     # --- 发送方法 ---
 
     async def send_json(self, data: dict) -> None:
-        """发送 JSON 消息 — 连接断开时静默跳过"""
+        """发送 JSON 消息 — 连接断开时静默跳过。
+
+        串行化发送: dispatcher 上下文与异步处理 task 可能并发发送
+        (speech_started/committed vs audio.delta), 无锁并发会让
+        Starlette WebSocket 的消息帧交错, 固件端 JSON 解析失败
+        (表现为 Unknown event / 静默丢消息)。"""
         if not self.websocket or self.state in (SessionState.CLOSED, SessionState.CLOSING):
             return
-        try:
-            # websockets 库: client_state 检查是否还能发送
-            if hasattr(self.websocket, 'client_state') and \
-               str(self.websocket.client_state) != 'OPEN':
-                return
-            await self.websocket.send_text(EventSerializer.serialize(data))
-        except Exception as e:
-            if "close message" not in str(e) and "not connected" not in str(e).lower():
-                self.slog.error(f"发送失败: {e}")
+        async with self._send_lock:
+            try:
+                # 连接状态检查: Starlette 用 WebSocketState.CONNECTED,
+                # python-websockets 用 State.OPEN — 两者都要接受
+                if hasattr(self.websocket, 'client_state'):
+                    cs = self.websocket.client_state
+                    cs_name = getattr(cs, 'name', str(cs))
+                    if cs_name not in ('CONNECTED', 'OPEN'):
+                        return
+                await self.websocket.send_text(EventSerializer.serialize(data))
+            except Exception as e:
+                if "close message" not in str(e) and "not connected" not in str(e).lower():
+                    self.slog.error(f"发送失败: {e}")
 
     async def send_error(self, error_type: str, message: str) -> None:
         """发送错误"""

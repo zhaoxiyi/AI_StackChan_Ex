@@ -42,7 +42,7 @@ bool RealtimeAEC::begin(const AecConfig* cfg)
     // 默认参数
     _cfg.mu              = 0.1f;
     _cfg.echo_gain       = 1.0f;
-    _cfg.noise_gate      = 60.0f;
+    _cfg.noise_gate      = 90.0f;   // 软衰减门限: 底噪(环境/残余回声)衰减÷4 到 <120 (服务端静音阈值), 轻声人声保留
     _cfg.vad_threshold   = 200.0f;
     _cfg.vad_confirm_ms  = 200;
     _cfg.enable          = true;
@@ -140,6 +140,14 @@ float RealtimeAEC::processFrame(int16_t* frame, bool* has_speech)
     }
     const float step = _cfg.mu / (x_norm + NLMS_EPS);
 
+    // ---- 双讲检测 (仅在滤波器收敛后启用) ----
+    // 收敛前必须让滤波器自由学习回声路径: 否则未收敛时残余≈输入 →
+    // 误判双讲 → 冻结适应 → 永不收敛的死锁。
+    // 收敛后启用保护: 近端人声主导时冻结, 防削人声。
+    bool near_end_talk = _converged &&
+                         (_stats.input_rms > 150.0f) &&
+                         (_stats.residual_rms > _stats.input_rms * 0.6f);
+
     float residual_sum = 0.0f;
     for (int n = 0; n < AEC_FRAME_SAMPLES; n++) {
         // 估计回声 y[n] = Σ w[k] * x[n-k] (x[n-1] 是最近样本)
@@ -161,32 +169,48 @@ float RealtimeAEC::processFrame(int16_t* frame, bool* has_speech)
         residual_sum += e * e;
 
         // ---- 权重更新 (NLMS, 步长按帧能量归一化) ----
-        idx = (int32_t)_refHistPos - 1;
-        for (int k = 0; k < AEC_FILTER_TAPS; k++) {
-            if (idx < 0) idx += AEC_HISTORY_SAMPLES;
-            _w[k] += step * e * (float)_refHist[idx];
-            idx--;
+        // 双讲时冻结 (保护近端人声); 单讲 (纯回声) 时正常适应
+        if (!near_end_talk) {
+            idx = (int32_t)_refHistPos - 1;
+            for (int k = 0; k < AEC_FILTER_TAPS; k++) {
+                if (idx < 0) idx += AEC_HISTORY_SAMPLES;
+                _w[k] += step * e * (float)_refHist[idx];
+                idx--;
+            }
         }
     }
 
     float residual_rms = sqrtf(residual_sum / AEC_FRAME_SAMPLES);
     _stats.residual_rms = residual_rms;
 
+    // ---- 发散保护: 残余能量异常高于输入 (滤波器发散/自激) → 重置权重 ----
+    if (input_rms > 50.0f && residual_rms > input_rms * 3.0f) {
+        memset(_w, 0, AEC_FILTER_TAPS * sizeof(float));
+        _converged = false;
+        if (_frameCount % 100 == 0) {
+            Serial.printf("[AEC] diverge detected (in=%.0f res=%.0f) → reset\n",
+                          input_rms, residual_rms);
+        }
+    }
+
     // ---- 回声衰减估计 (dB) ----
     if (input_rms > 1.0f) {
         float atten = 20.0f * log10f((residual_rms + 1.0f) / (input_rms + 1.0f));
         _stats.echo_attenuation_db = atten;
         // 收敛判定: 衰减稳定且滤波器有非零权重
-        if (atten < -15.0f && _frameCount > 100) {
+        if (atten < -8.0f && _frameCount > 150) {   // -8dB 即可判收敛 (双讲保护启用门槛)
             _converged = true;
         }
     }
     _stats.frames_processed = _frameCount;
 
-    // ---- 噪声门限降噪 ----
-    if (residual_rms < _cfg.noise_gate) {
-        memset(frame, 0, AEC_FRAME_SAMPLES * sizeof(int16_t));
-        residual_rms = 0.0f;
+    // ---- 噪声门限降噪 (软衰减, 不清零) ----
+    // 原实现低于门限直接置零 → 轻声说话/句中停顿被香掉 → STT 收不到
+    if (_cfg.noise_gate > 0.0f && residual_rms < _cfg.noise_gate) {
+        for (int i = 0; i < AEC_FRAME_SAMPLES; i++) {
+            frame[i] = frame[i] >> 2;          // /4 衰减 (保留信号连续性)
+        }
+        residual_rms *= 0.25f;
     }
 
     // ---- VAD (能量 + 过零率) ----

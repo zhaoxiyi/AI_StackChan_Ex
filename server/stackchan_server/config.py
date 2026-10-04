@@ -151,12 +151,28 @@ class InterruptionConfig(BaseModel):
     """打断策略"""
     enabled: bool = True
     strategy: str = "immediate_stop"       # immediate_stop | fade_out
+    # ---- 全双工语音打断 (SPEAKING 期间检测用户语音) ----
+    # 音频 RMS 阈值: AEC 后上传的音频中, 残余回声低于此值,
+    # 用户真实语音高于此值 (16bit PCM, 室内语音典型 300-2000)
+    speech_rms_threshold: int = 400
+    # 连续超阈值块数 (每块 ~125ms): 去抖, 防短促噪声误触发
+    speech_confirm_blocks: int = 3
 
 
 class HistoryConfig(BaseModel):
     """对话历史"""
     max_messages: int = 20
     enable_summary: bool = True
+    # Context 字符预算: 发给 LLM 的历史消息总字符数上限 (含 system prompt)
+    # 0 = 不限制。中文≈1字/1token, 取模型上下文窗口的 2/3 左右
+    # (qwen3-8b 窗口 8192 tokens → 建议 4000-5000)
+    max_context_chars: int = 4000
+    # STT 文本精简: 抛弃重复内容与口语填充词, 保留语义后入 Context
+    enable_condense: bool = True
+    # 被字符预算挤出的旧消息 → 摘要保留的字符预算 (不硬丢弃旧上下文)
+    summary_budget_chars: int = 350
+    # 用户更正记录上限 (保持后续对话正确方向)
+    corrections_max: int = 5
 
 
 class UtteranceConfig(BaseModel):

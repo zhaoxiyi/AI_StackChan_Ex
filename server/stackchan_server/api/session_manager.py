@@ -33,6 +33,9 @@ class SessionEntry:
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
     disconnected_at: Optional[float] = None  # 断线时间 (None=在线)
+    # True = WebSocket 真断开 (短窗口, 等固件重连);
+    # False = 心跳静默 (WS 仍活, 用户只是暂时没说话 — 历史长保留)
+    ws_disconnected: bool = False
 
 
 class SessionManager:
@@ -47,9 +50,12 @@ class SessionManager:
         session = await mgr.try_reconnect("m5stack-abc123")  # 30s 内可恢复
     """
 
-    # 重连保留窗口 (秒)
+    # 重连保留窗口 (秒) — WebSocket 真断开后的会话恢复窗口
     RECONNECT_WINDOW: float = 30.0
-    # 心跳超时 (秒) — 超过此时间无消息视为僵尸
+    # 历史保留时长 (秒) — WS 仍存活但用户静默时, 对话历史保留时长
+    # 固件半双工: 用户不说话就不上行, 不能因为静默就丢掉上下文
+    HISTORY_RETAIN_SECONDS: float = 600.0
+    # 心跳超时 (秒) — 超过此时间无消息视为静默
     HEARTBEAT_TIMEOUT: float = 60.0
     # 清理间隔 (秒)
     CLEANUP_INTERVAL: float = 15.0
@@ -79,9 +85,10 @@ class SessionManager:
             if entry.disconnected_at is not None:
                 # 断线重连
                 elapsed = time.time() - entry.disconnected_at
-                if elapsed <= self.RECONNECT_WINDOW:
+                if elapsed <= self._retain_window(entry):
                     self._slog.info(f"设备 {device_id} 重连恢复 (离线 {elapsed:.1f}s)")
                     entry.disconnected_at = None
+                    entry.ws_disconnected = False
                     entry.last_active = time.time()
                     return entry.session
                 else:
@@ -107,17 +114,24 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     def mark_disconnected(self, device_id: str) -> None:
-        """标记断线 — 启动 30s 重连窗口"""
+        """标记断线 — WebSocket 真断开, 启动 30s 重连窗口"""
         entry = self._entries.get(device_id)
         if entry and entry.disconnected_at is None:
             entry.disconnected_at = time.time()
+            entry.ws_disconnected = True
             self._slog.info(f"设备 {device_id} 已断线 (保留 {self.RECONNECT_WINDOW}s)")
 
     def touch(self, device_id: str) -> None:
-        """更新最后活跃时间 (收到任何消息时调用)"""
+        """更新最后活跃时间 (收到任何消息时调用)
+
+        WS 仍存活时若曾被标记静默 (心跳超时), 收到消息即恢复在线,
+        对话历史不丢。
+        """
         entry = self._entries.get(device_id)
         if entry:
             entry.last_active = time.time()
+            if entry.disconnected_at is not None and not entry.ws_disconnected:
+                entry.disconnected_at = None
 
     def get(self, device_id: str) -> Optional[ConversationSession]:
         """获取会话 (不创建)"""
@@ -157,22 +171,32 @@ class SessionManager:
         for device_id, entry in self._entries.items():
             # 1. 断线超时
             if entry.disconnected_at is not None:
-                if now - entry.disconnected_at > self.RECONNECT_WINDOW:
+                if now - entry.disconnected_at > self._retain_window(entry):
                     to_remove.append(device_id)
-                    self._slog.info(f"设备 {device_id} 重连超时，清理会话")
+                    self._slog.info(f"设备 {device_id} 保留超时，清理会话")
                     continue
 
-            # 2. 心跳超时 (在线但长时间无活动)
+            # 2. 心跳静默 (WS 在线但长时间无消息)
+            #    不立即清理: 固件半双工, 用户不说话就不上行,
+            #    静默 ≠ 下线 — 仅标记进入长保留窗口, 历史不丢。
             if entry.disconnected_at is None:
                 if now - entry.last_active > self.HEARTBEAT_TIMEOUT:
-                    to_remove.append(device_id)
-                    self._slog.info(f"设备 {device_id} 心跳超时 ({self.HEARTBEAT_TIMEOUT}s)，清理僵尸会话")
+                    entry.disconnected_at = now
+                    entry.ws_disconnected = False
+                    self._slog.info(
+                        f"设备 {device_id} 心跳静默 ({self.HEARTBEAT_TIMEOUT}s)，"
+                        f"历史保留 {self.HISTORY_RETAIN_SECONDS:.0f}s"
+                    )
                     continue
 
         for device_id in to_remove:
             entry = self._entries.pop(device_id, None)
             if entry:
                 entry.session.reset()
+
+    def _retain_window(self, entry: SessionEntry) -> float:
+        """保留窗口: WS 真断开用短重连窗口, 静默用长历史保留"""
+        return self.RECONNECT_WINDOW if entry.ws_disconnected else self.HISTORY_RETAIN_SECONDS
 
     # ------------------------------------------------------------------
     # 状态查询

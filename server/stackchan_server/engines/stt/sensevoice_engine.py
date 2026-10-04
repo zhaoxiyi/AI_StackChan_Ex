@@ -883,7 +883,10 @@ class SenseVoiceSTTEngine(BaseSTT):
         )))
 
         chunk_ms = len(audio_chunk) / 32.0  # 16kHz * 2B = 32 B/ms
-        if rms_val < 120.0:
+        # 静音阈值: 全双工下 AEC 残余底噪较高 (实测 90-180), 阈值相应提高
+        # (人声典型 300-2000, 仍可区分)
+        silence_rms = 250.0
+        if rms_val < silence_rms:
             self._silence_ms += chunk_ms
         else:
             self._silence_ms = 0.0

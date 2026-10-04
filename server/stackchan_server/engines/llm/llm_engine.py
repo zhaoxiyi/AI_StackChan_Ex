@@ -206,8 +206,8 @@ class LLMEngine(BaseLLM):
         self,
         messages: list[LLMMessage],
         *,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
+        temperature: float = 0.0,   # 0 = 用 config
+        max_tokens: int = 0,        # 0 = 用 config (模型窗口适配)
     ) -> AsyncIterator[str]:
         """
         流式生成对话回复。
@@ -228,6 +228,12 @@ class LLMEngine(BaseLLM):
         """
         if not self._http:
             raise EngineError("引擎未初始化", self._backend)
+
+        # 从 config.extra 解析实际参数
+        if max_tokens <= 0:
+            max_tokens = (self._config.extra.get("max_tokens") or 1024) if self._config else 1024
+        if temperature <= 0.0:
+            temperature = (self._config.extra.get("temperature") or 0.7) if self._config else 0.7
 
         # DeepSeek 余额预检
         if self._balance_checker and self._balance_checker.is_depleted:

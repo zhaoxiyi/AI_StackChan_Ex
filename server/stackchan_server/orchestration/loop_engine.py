@@ -46,6 +46,8 @@ class LoopEngine:
             try:
                 eng = LLMEngine()
                 extra = {}
+                extra["max_tokens"] = entry.max_tokens      # 模型窗口适配 (如 MiniCPM-o 窗口 2048)
+                extra["temperature"] = entry.temperature
                 if name == "deepseek":
                     extra["backend"] = "deepseek"
                     if entry.api_key.startswith("${"):

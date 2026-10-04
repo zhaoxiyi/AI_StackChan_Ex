@@ -29,6 +29,7 @@ numpy>=2.0.0
 
 # === 可选: 文本转语音 (TTS) ===
 # edge-tts>=6.1.0              # pip install edge-tts
+# miniaudio>=1.57              # MP3→PCM 解码 (固件 playRaw 需要 PCM 16-bit 24kHz)
 
 # === 可选: Opus 编解码 ===
 # opuslib>=3.0.0               # pip install opuslib

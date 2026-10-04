@@ -143,6 +143,8 @@ void battery_check(void *args) {
   for (;;)
   {
     int32_t batteryLevel = M5.Power.getBatteryLevel();
+    Serial.printf("[PWR] battery=%d%% charging=%d\n",
+                  (int)batteryLevel, (int)M5.Power.isCharging());   // 充电状态诊断
     if((batteryLevel < 95) && (batteryLevel != 0)){
       avatar->setBatteryIcon(true);
       avatar->setBatteryStatus(M5.Power.isCharging(), M5.Power.getBatteryLevel());
@@ -301,6 +303,10 @@ ModBase* init_mod(void)
 
 void sw_tone()
 {
+#ifdef REALTIME_FULL_DUPLEX
+  // 全双工: Mic/Speaker 常开 (duplex I2S), 不做设备切换
+  M5.Speaker.tone(1000, 100);
+#else
   enterMutexAudio();
   M5.Mic.end();
   M5.Speaker.begin();
@@ -311,10 +317,22 @@ void sw_tone()
   M5.Speaker.end();
   M5.Mic.begin();
   exitMutexAudio();
+#endif
 }
   
 void alarm_tone()
 {
+#ifdef REALTIME_FULL_DUPLEX
+  // 全双工: 不做设备切换, 直接循环提示音
+  for(int i=0; i<5; i++){
+    M5.Speaker.tone(1200, 50);
+    delay(100);
+    M5.Speaker.tone(1200, 50);
+    delay(100);
+    M5.Speaker.tone(1200, 50);
+    delay(1000);
+  }
+#else
   enterMutexAudio();
   M5.Mic.end();
   M5.Speaker.begin();
@@ -331,10 +349,18 @@ void alarm_tone()
   M5.Speaker.end();
   M5.Mic.begin();
   exitMutexAudio();
+#endif
 }
 
 void init_mic_spk()
 {
+#ifdef REALTIME_FULL_DUPLEX
+  // 全双工: I2S (TX+RX) 由 RealtimeChatGPT 的 duplex 初始化独占。
+  // 此处若 M5.Mic.begin() 会预占用 I2S_NUM_1 → Speaker 安装失败
+  // (register I2S object failed) → 驱动半异常 → TX DMA 不消费 → 播放卡死。
+  Serial.println("[FD] skip init_mic_spk (duplex owns I2S)");
+  return;
+#else
 #if defined(USE_AUDIO_MODULE)
   initAudioModule();
 #endif
@@ -368,6 +394,7 @@ void init_mic_spk()
     M5.Speaker.config(spk_cfg);
   }
   //M5.Speaker.begin();
+#endif  // REALTIME_FULL_DUPLEX
 }
 
 void setup()

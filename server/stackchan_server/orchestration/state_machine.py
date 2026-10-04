@@ -42,7 +42,7 @@ class ConversationState(Enum):
 TRANSITIONS: dict[ConversationState, set[ConversationState]] = {
     ConversationState.IDLE:        {ConversationState.LISTENING},
     ConversationState.LISTENING:   {ConversationState.REASONING, ConversationState.IDLE},
-    ConversationState.REASONING:   {ConversationState.SPEAKING, ConversationState.INTERRUPTED, ConversationState.IDLE},
+    ConversationState.REASONING:   {ConversationState.SPEAKING, ConversationState.INTERRUPTED, ConversationState.IDLE, ConversationState.LISTENING},
     # SPEAKING → LISTENING: 断句驱动的连续对话 (回复完毕直接回到收听, 不等 commit)
     ConversationState.SPEAKING:    {ConversationState.IDLE, ConversationState.INTERRUPTED, ConversationState.LISTENING},
     ConversationState.INTERRUPTED: {ConversationState.LISTENING, ConversationState.IDLE},

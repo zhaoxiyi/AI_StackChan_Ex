@@ -135,10 +135,14 @@ class SessionConfig:
 # =============================================================================
 
 def build_session_updated(session_id: str, cfg: SessionConfig) -> dict:
-    """构建 session.updated 确认消息
-    
-    协议兼容: 固件端收到此事件后切换到 "Please touch" 状态。
-    必须包含 session 对象，否则固件可能解析失败。
+    """构建 session.updated 确认消息 (极简版)
+
+    协议兼容: 固件端收到此事件后仅执行 avatar.setSpeechText("Please touch"),
+    不解析 session 内容。因此不回显 tools/instructions — 固件端 session.update
+    携带 14 个 tools + 超长 instructions (约 8KB), 完整回显会超过固件
+    WebSockets 库的接收缓冲, 卡坏接收流导致后续所有消息 (committed /
+    audio.delta) 无法接收 (表现为 Unknown event + 无声)。
+    极简回显 (< 500B) 保证接收流畅通。
     """
     return {
         "type": ServerEvent.SESSION_UPDATED.value,
@@ -147,11 +151,11 @@ def build_session_updated(session_id: str, cfg: SessionConfig) -> dict:
             "type": "realtime",
             "model": cfg.model,
             "modalities": cfg.modalities,
-            "audio": cfg.audio,
-            "instructions": cfg.instructions,
-            "tools": cfg.tools,
-            "tool_choice": cfg.tool_choice,
+            "audio": cfg.audio,        # 小 (格式声明, 无 tools)
+            "tools": [],               # 不回显 (关键: 避免大消息)
+            "tool_choice": "auto",
             "temperature": cfg.temperature,
+            "instructions": "",        # 不回显 (关键: 避免大消息)
         },
     }
 

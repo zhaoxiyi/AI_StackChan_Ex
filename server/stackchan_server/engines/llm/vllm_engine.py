@@ -38,11 +38,17 @@ class VLLMEngine(BaseLLM):
         self,
         messages: list[LLMMessage],
         *,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
+        temperature: float = 0.0,   # 0 = 用 config
+        max_tokens: int = 0,        # 0 = 用 config (关键: 模型窗口适配, 不能硬编码)
     ) -> AsyncIterator[str]:
         if not self._http:
             raise EngineError("引擎未初始化", "vllm")
+
+        # 从 config.extra 解析实际参数 (模型窗口适配, 不能硬编码)
+        if max_tokens <= 0:
+            max_tokens = (self._config.extra.get("max_tokens") or 512) if self._config else 512
+        if temperature <= 0.0:
+            temperature = (self._config.extra.get("temperature") or 0.7) if self._config else 0.7
 
         self._state = EngineState.RUNNING
         self._cancel.clear()

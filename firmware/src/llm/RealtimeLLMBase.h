@@ -72,7 +72,14 @@ public:
 
     int base64_decode(const char* input, int size, char* output);
     void hexdump(const void *mem, uint32_t len, uint8_t cols = 16);
-    void streamAudioDelta(String& delta);
+    virtual void streamAudioDelta(String& delta);
+
+    // ---- 全双工钩子 (RealtimeChatGPT 覆写) ----
+    // 录音开始/停止 (触摸/超时/committed 触发, 全双工下同步控制采集任务)
+    virtual void onRecordingStart() {}
+    virtual void onRecordingStop()  {}
+    // webSocketProcess 每轮 loop() 后调用 (全双工下 flush 上传队列等)
+    virtual void onWsTick() {}
 
     // for TTS
     //

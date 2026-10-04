@@ -8,3 +8,9 @@ apikey:
   stt: "********"       # ApiKey of SpeechToText Service
   aiservice: "********" # ApiKey of AIService
   tts: "********"       # ApiKey of TextToSpeech Service
+
+# 本地上位机 (全双工 Realtime 服务) 地址
+# Realtime 模式固件读取此配置连接上位机, 替代云端 api.openai.com
+realtimeServer:
+  host: "192.168.1.100"   # 上位机电脑的局域网 IP
+  port: 8080              # 上位机服务端口 (server/config.yaml 的 server.port)

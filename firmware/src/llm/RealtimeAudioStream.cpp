@@ -159,10 +159,11 @@ void RealtimeAudioStream::_processCaptureChunk(int16_t* chunk, size_t samples)
 
 void RealtimeAudioStream::submitPlayback(const int16_t* pcm, size_t samples, int sample_rate)
 {
-    // 1. 注入 AEC 参考信号 (必须在播放前, 与回声对齐)
-    _aec.pushReference(pcm, samples, sample_rate);
-
-    // 2. 写入环形缓冲 (空间不足时丢弃最旧数据 — 优先实时性)
+    // 写入环形缓冲 (空间不足时丢弃最旧数据 — 优先实时性)
+    // 注意: AEC 参考注入在播放任务实际发声前进行 (见 _playLoop),
+    // 保证参考信号与麦克风听到的回声时间对齐 — 若在此处注入,
+    // 参考会比实际发声提前一个环形缓冲深度 (~50-100ms),
+    // 超出 AEC 参考历史 (32ms) 导致回声消除失效。
     for (size_t i = 0; i < samples; i++) {
         uint32_t next = (_ringHead + 1) % PLAY_RING_SAMPLES;
         if (next == _ringTail) {
@@ -220,6 +221,9 @@ void RealtimeAudioStream::_playLoop()
             slice[i] = _playRing[_ringTail];
             _ringTail = (_ringTail + 1) % PLAY_RING_SAMPLES;
         }
+
+        // 实际发声前注入 AEC 参考信号 (与播放时间对齐)
+        _aec.pushReference(slice, take, PLAY_SAMPLE_RATE);
 
         // 播放 (异步 DMA, 不阻塞)
         enterMutexAudio();

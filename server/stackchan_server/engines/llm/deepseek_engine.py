@@ -66,9 +66,13 @@ class DeepSeekEngine(BaseLLM):
         self,
         messages: list[LLMMessage],
         *,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
+        temperature: float = 0.0,   # 0 = 用 config
+        max_tokens: int = 0,        # 0 = 用 config
     ) -> AsyncIterator[str]:
+        if max_tokens <= 0:
+            max_tokens = (self._config.extra.get("max_tokens") or 4096) if self._config else 4096
+        if temperature <= 0.0:
+            temperature = (self._config.extra.get("temperature") or 0.7) if self._config else 0.7
         if self._balance_depleted:
             raise EngineUnavailableError("DeepSeek 余额不足", "deepseek")
 
