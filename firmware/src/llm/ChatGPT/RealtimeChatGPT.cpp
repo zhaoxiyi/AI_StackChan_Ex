@@ -90,6 +90,8 @@ static const char response_create[] =
 // WebSocketのコールバック関数としてクラスメソッドを渡せないので、コールバック関数を
 // 通常の関数にして静的変数を経由してクラスのthisポインタを渡す。
 static RealtimeChatGPT* p_this;
+static uint32_t s_wsDiscCount = 0;      // WS 断连计数 (诊断: 区分真实断开与重连失败)
+static uint32_t s_wsLastConnMs = 0;     // 最近一次连接成功时刻
 
 #ifdef REALTIME_FULL_DUPLEX
 static bool fd_init_duplex();   // 定义在文件后部 (全双工实现块)
@@ -100,9 +102,13 @@ static void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 
 	switch(type) {
 		case WStype_DISCONNECTED:
-			Serial.printf("[WSc] Disconnected!\n");
+			s_wsDiscCount++;
+			Serial.printf("[WSc] Disconnected! #%u (uptime=%us, last_conn_ago=%us)\n",
+			              (unsigned)s_wsDiscCount, (unsigned)(millis() / 1000),
+			              (unsigned)((millis() - s_wsLastConnMs) / 1000));
 			break;
 		case WStype_CONNECTED:
+			s_wsLastConnMs = millis();
 			Serial.printf("[WSc] Connected to url: %s\n", payload);
 
             /*
@@ -397,6 +403,11 @@ RealtimeChatGPT::RealtimeChatGPT(llm_param_t param)
 
   // try ever 5000 again if connection has failed
   webSocket.setReconnectInterval(5000);
+  // 心跳保活: 10s ping / 15s pong 超时 / 3 次判死自动重连
+  // (参数宽松: server 端 STT/TTS 重活会阻塞事件循环数秒,
+  //  过紧的 pong 超时(如 3s)会误判断线→"连上又断"循环;
+  //  服务器侧 websockets 库自动回 pong, 不影响应用层)
+  webSocket.enableHeartbeat(10000, 15000, 3);
 
 #ifdef REALTIME_FULL_DUPLEX
   // 全双工 (CoreS3 duplex I2S): TX/RX 统一 16kHz mono
@@ -573,7 +584,10 @@ static bool fd_init_duplex()
         return false;
     }
     fd_patch_rx_path(16000);
-    // 注: 不主动初始化 ES7210 (出厂默认配置与 mono 读取兼容)
+    // ES7210 麦克风阵列主动配置:
+    //   全双工模式跳过了 M5.Mic.begin() (I2S 互斥), ES7210 无人配置;
+    //   芯片上电默认态不可靠 (掉电后实测读全 0), 序列与 test_duplex 验证工程一致
+    fd_es7210_init();
     fd_i2s_mtx = xSemaphoreCreateMutex();   // I2S 调用互斥
 
     // AW88298 音量覆盖: M5Unified cb 默认 full (0x64), 近场回声会饱和 → 降至 0x20
@@ -635,10 +649,16 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
 {
     RealtimeChatGPT* self = (RealtimeChatGPT*)arg;
     static int16_t play_buf[800];
-    static int16_t ref_out[800];
     static int16_t cap_buf[1600];
-    static int16_t ref_delay_line[2048];     // 参考延迟线 (DMA 128ms 补偿)
-    static size_t  ref_pos = 0;
+
+    // 启动诊断: 本任务栈地址与余量 (排查库越界写栈 canary)
+    {
+        int16_t stack_anchor = 0;
+        Serial.printf("[FD] audio task: stack~%p hwm_free=%uB outBuf=%p\n",
+                      (void*)&stack_anchor,
+                      (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                      (const void*)self->fd_aec.outBufAddr());
+    }
 
     while (self->fd_playing) {
         // ---- 1) 播放 (短超时; 写多少消费多少) ----
@@ -649,22 +669,17 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
             i2s_write(FD_I2S_PORT, play_buf, n * 2, &w, pdMS_TO_TICKS(5));
             size_t written = (w & ~(size_t)1) / 2;      // 实际写入帧数 (取偶)
             if (written > 0) {
-                // 参考延迟补偿: 延迟 2048 帧(128ms) 对齐 DMA 出声时刻;
-                // 只推送实际写入的数据, 参考与输出严格一致 (AEC 收敛前提)
-                for (size_t i = 0; i < written; i++) {
-                    int16_t old = ref_delay_line[ref_pos];
-                    ref_delay_line[ref_pos] = play_buf[i];
-                    ref_pos = (ref_pos + 1) % 2048;
-                    ref_out[i] = old;
-                }
-                self->fd_aec.pushReference(ref_out, written, 16000);
+                // 参考信号 = 实际写入 I2S 的 PCM (与输出严格一致, AEC 收敛前提)。
+                // 出声时刻的回波延迟由 RealtimeAEC 自动互相关对齐 (auto_align),
+                // 不再硬编码延迟线 (旧的 128ms 猜测与实际不符时 AEC 失效)。
+                self->fd_aec.pushReference(play_buf, written, 16000);
             }
             self->_fd_ring_advance(written);            // 只消费已写入部分
             self->fd_stat_bytes += w;
             self->fd_stat_write_ms += millis() - t_w;
         }
 
-        // ---- 2) 采集 (短超时; 累加凑帧: 每轮读取量不定, 不足 20ms 帧时缓存待拼) ----
+        // ---- 2) 采集 (短超时; 累加凑帧: 每轮读取量不定, 不足 16ms 帧时缓存待拼) ----
         if (self->fd_capturing) {
             size_t rr = 0;
             i2s_read(FD_I2S_PORT, cap_buf, sizeof(cap_buf), &rr, pdMS_TO_TICKS(5));
@@ -673,7 +688,7 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
                 size_t frames = rr / 2;
                 size_t off = 0;
                 while (off < frames) {
-                    // 先填满拼帧缓存 (AEC 固定 320 样本/帧)
+                    // 先填满拼帧缓存 (AEC 固定 256 样本/帧 @16kHz)
                     size_t need = AEC_FRAME_SAMPLES - self->fd_pend_len;
                     size_t take = (frames - off < need) ? (frames - off) : need;
                     memcpy(&self->fd_pend_buf[self->fd_pend_len],
@@ -682,14 +697,17 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
                     off += take;
                     if (self->fd_pend_len < AEC_FRAME_SAMPLES) break;   // 未凑够, 等下次读取
 
-                    // ---- 完整 20ms 帧: AEC 处理 → 写入上传缓冲 ----
+                    // ---- 完整 16ms 帧: AEC (esp-aec) 处理 → 写入上传缓冲 ----
                     bool hs = false;
 #ifdef AEC_DIAG
                     for (int k = 0; k < AEC_FRAME_SAMPLES; k++)
                         self->fd_diag_in2 += (double)self->fd_pend_buf[k] * self->fd_pend_buf[k];
                     self->fd_diag_n += AEC_FRAME_SAMPLES;
 #endif
+                    uint32_t t_aec = micros();
                     self->fd_aec.processFrame(self->fd_pend_buf, &hs);
+                    self->fd_stat_aec_us += micros() - t_aec;   // AEC 每帧耗时诊断
+                    self->fd_stat_aec_n++;
 #ifdef AEC_DIAG
                     for (int k = 0; k < AEC_FRAME_SAMPLES; k++)
                         self->fd_diag_out2 += (double)self->fd_pend_buf[k] * self->fd_pend_buf[k];
@@ -721,14 +739,18 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
             size_t av = (self->fd_ring_head >= self->fd_ring_tail)
                       ? (self->fd_ring_head - self->fd_ring_tail)
                       : (FD_RING_FRAMES - self->fd_ring_tail + self->fd_ring_head);
-            Serial.printf("[FD] play2s: ring=%ufr wrote=%uB w_ms=%ums cap=%uB flush=%u try=%u ok=%u fail=%u\n",
+            uint32_t aec_avg = self->fd_stat_aec_n
+                             ? (self->fd_stat_aec_us / self->fd_stat_aec_n) : 0;
+            Serial.printf("[FD] play2s: ring=%ufr wrote=%uB w_ms=%ums cap=%uB flush=%u try=%u ok=%u fail=%u aec=%uus hwm=%uB\n",
                           (unsigned)av, (unsigned)self->fd_stat_bytes,
                           (unsigned)self->fd_stat_write_ms,
                           (unsigned)self->fd_stat_cap_bytes,
                           (unsigned)self->fd_stat_flush,
                           (unsigned)self->fd_stat_try,
                           (unsigned)self->fd_stat_ok,
-                          (unsigned)self->fd_stat_fail);
+                          (unsigned)self->fd_stat_fail,
+                          (unsigned)aec_avg,
+                          (unsigned)uxTaskGetStackHighWaterMark(NULL));
             self->fd_stat_t = now;
             self->fd_stat_bytes = 0;
             self->fd_stat_write_ms = 0;
@@ -737,13 +759,16 @@ void RealtimeChatGPT::fd_audio_task(void* arg)
             self->fd_stat_try = 0;
             self->fd_stat_ok = 0;
             self->fd_stat_fail = 0;
+            self->fd_stat_aec_us = 0;
+            self->fd_stat_aec_n = 0;
 #ifdef AEC_DIAG
             if (self->fd_diag_n > 0) {
                 float in_rms  = sqrtf((float)(self->fd_diag_in2 / self->fd_diag_n));
                 float out_rms = sqrtf((float)(self->fd_diag_out2 / self->fd_diag_n));
-                Serial.printf("[FD] aec2s: in=%6.0f out=%6.0f atten=%6.1fdB  (in>1000 即播报期回声, 看此时衰减)\n",
+                Serial.printf("[FD] aec2s: in=%6.0f out=%6.0f atten=%6.1fdB k0=%ums  (in>1000 即播报期回声, 看此时衰减)\n",
                               in_rms, out_rms,
-                              20.0f * log10f((out_rms + 1e-3f) / (in_rms + 1e-3f)));
+                              20.0f * log10f((out_rms + 1e-3f) / (in_rms + 1e-3f)),
+                              (unsigned)(self->fd_aec.refDelay() * 1000 / 16000));
                 self->fd_diag_in2 = 0.0;
                 self->fd_diag_out2 = 0.0;
                 self->fd_diag_n = 0;
@@ -790,13 +815,20 @@ void RealtimeChatGPT::onRecordingStart()
         fd_pend_len = 0;
         fd_up_ready[0] = fd_up_ready[1] = false;
         fd_ring_head = fd_ring_tail = 0;
-        fd_aec.begin(nullptr);      // 会话开始 → AEC 初始化/复位
+        // 会话开始 → AEC 初始化 (重复调用安全; 返回 false 时内部走直通, 不崩)
+        if (!fd_aec.begin(nullptr)) {
+            Serial.println("[FD] AEC begin 失败 — 无 AEC 直通模式");
+        } else {
+            Serial.printf("[FD] AEC ready: backend=%s\n",
+                          (fd_aec.backend() == AEC_BACKEND_ESP_SR) ? "esp-sr" : "nlms");
+        }
         Serial.println("[FD] capture start (single-task mode)");
     }
     if (!fd_playing) {
         fd_playing = true;
         // 单音频任务 (core1): 交替播放/采集, 无跨任务 I2S 并发
-        xTaskCreatePinnedToCore(fd_audio_task, "fdAudio", 8192, this, 5, NULL, 1);
+        // 栈 16384: esp-sr aec_process/创建路径调用较深, 防栈溢出
+        xTaskCreatePinnedToCore(fd_audio_task, "fdAudio", 16384, this, 5, NULL, 1);
         Serial.println("[FD] audio task started");
     }
 }

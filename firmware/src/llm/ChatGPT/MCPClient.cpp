@@ -48,6 +48,9 @@ String toolCallJson =
 
 String g_mcpInitResult = "";
 
+// MCP 单次操作超时 (ms): 防"TCP 连上但 SSE 无响应"时无限循环卡死启动/主流程
+#define MCP_OP_TIMEOUT_MS  (8000)
+
 void initMcpClientList(MCPClient** mcpClient, mcp_server_s* mcpParam, int nMcp)
 {
   M5.Lcd.printf("Connect MCP Servers (%d)\n", nMcp);
@@ -146,9 +149,14 @@ String MCPClient::mcp_list_tools()
                   "Accept: text/event-stream\r\n" +
                   "Connection: keep-alive\r\n\r\n");
 
+    uint32_t t0 = millis();
     while(!request_complete){
       pole_stream(toolsListJson);
       delay(100);
+      if (millis() - t0 > MCP_OP_TIMEOUT_MS) {
+        Serial.println("MCPClient: list_tools timeout");
+        break;
+      }
     }
 
     stream.stop();
@@ -191,9 +199,14 @@ String MCPClient::mcp_call_tool(DynamicJsonDocument& tool_params)
                   "Accept: text/event-stream\r\n" +
                   "Connection: keep-alive\r\n\r\n");
 
+    uint32_t t0 = millis();
     while(!request_complete){
       pole_stream(json_str);
       delay(100);
+      if (millis() - t0 > MCP_OP_TIMEOUT_MS) {
+        Serial.println("MCPClient: call_tool timeout");
+        break;
+      }
     }
 
     stream.stop();

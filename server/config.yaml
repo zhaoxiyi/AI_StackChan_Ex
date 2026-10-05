@@ -64,6 +64,8 @@ stt:
     use_itn: true                # 逆文本归一化 (数字/日期自动转写)
     silence_break_ms: 1200       # 静音断句阈值 (阶段性停顿才触发识别)
     max_audio_ms: 15000          # 音频最长累积
+    min_speech_rms: 180          # 触发识别的最低段平均能量 (低于则视为噪声丢弃,
+                                 # 防安静段被"编"出无意义文本白触发 LLM)
   cpu_stt:
     model_size: "small"              # tiny, base, small, medium
     device: "auto"                   # auto, cpu, cuda
@@ -140,9 +142,21 @@ conversation:
     1. 始终使用简体中文回复（硬性要求，不得使用日语或英语单词）
     2. 回复简短自然，通常 1-3 句话，像日常对话一样
     3. 语气温暖、友好、略带俏皮
+    4. 不要复述用户的原话，直接回答内容（禁止以重复用户问句开头）
+    5. 不要连续重复之前的回答；已说过的话要换个说法或补充新信息
 
     注意：你的回复会被语音合成播出，所以只说普通话，不要夹杂其他语言。
   
+  # LLM 输出复读治理 (检测 + 剔除 + 重生成)
+  response_guard:
+    enabled: true
+    user_echo_min_chars: 6       # 复读片段最短字符数 (低于不算复读, 防寒暄误伤)
+    user_echo_ratio: 0.5         # 重合占用户输入的比例阈值
+    min_kept_chars: 6            # 剔除后剩余低于此 → 重生成
+    self_repeat_similarity: 0.8  # 与近期回复相似度阈值
+    self_repeat_window: 3        # 比较最近 N 条助手回复
+    self_repeat_short_max: 40    # 仅短回复触发重生成
+    max_retries: 1               # 每轮重生成上限
   # Turn detection
   turn:
     silence_timeout_ms: 2000          # Stop listening after 2s silence
@@ -157,6 +171,12 @@ conversation:
     # 全双工语音打断: SPEAKING 期间检测用户语音 (固件 AEC 后音频)
     speech_rms_threshold: 400         # RMS 阈值 (16bit PCM, 室内语音典型 300-2000)
     speech_confirm_blocks: 3          # 连续超阈值块数 (~125ms/块) 去抖 | queue
+    # 播放中插话 (barge-in v1: 相对下行回声判据;
+    # AEC 未收敛期回声 10000+, 绝对阈值不可用)
+    tail_guard_s: 0.4                 # 下行停止后尾音保护时长
+    echo_factor: 0.8                  # 回声水平估计系数 (下行 RMS × 系数)
+    barge_in_ratio: 1.6               # 上行需超过回声估计的倍数
+    barge_in_floor: 400               # 判据绝对底线
   
   # Conversation history
   history:

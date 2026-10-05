@@ -157,6 +157,14 @@ class InterruptionConfig(BaseModel):
     speech_rms_threshold: int = 400
     # 连续超阈值块数 (每块 ~125ms): 去抖, 防短促噪声误触发
     speech_confirm_blocks: int = 3
+    # ---- 播放中插话 (barge-in v1: 相对下行回声判据) ----
+    # AEC 未收敛期回声使上行 RMS 达 10000+, 绝对阈值无法区分插话;
+    # 但回声幅度随下行内容同步波动, 故采用"上行显著超过下行回声估计"判据:
+    #   thr = down_rms × echo_factor × barge_in_ratio + barge_in_floor
+    tail_guard_s: float = 0.4          # 下行停止后尾音保护时长 (此内不判打断)
+    echo_factor: float = 0.8           # 回声水平估计系数 (下行片 RMS × 系数)
+    barge_in_ratio: float = 1.6        # 上行需超过回声估计的倍数
+    barge_in_floor: float = 400.0      # 判据绝对底线 (防下行小时误触发)
 
 
 class HistoryConfig(BaseModel):
@@ -173,6 +181,25 @@ class HistoryConfig(BaseModel):
     summary_budget_chars: int = 350
     # 用户更正记录上限 (保持后续对话正确方向)
     corrections_max: int = 5
+
+
+class ResponseGuardConfig(BaseModel):
+    """LLM 输出复读治理 (检测 + 剔除 + 重生成)"""
+    enabled: bool = True
+    # 复读用户检测: 回复与用户输入的重合片段最短字符数
+    user_echo_min_chars: int = 6
+    # 重合占用户输入 (去标点) 的比例阈值, 超过判定为复读用户
+    user_echo_ratio: float = 0.5
+    # 剔除复读片段后剩余文本低于此字数 → 整条重生成
+    min_kept_chars: int = 6
+    # 自我复读检测: 与近期助手回复的 bigram Jaccard 相似度阈值
+    self_repeat_similarity: float = 0.8
+    # 比较的近期助手回复条数
+    self_repeat_window: int = 3
+    # 仅对短回复触发重生成 (长回复成本高且相似概率低)
+    self_repeat_short_max: int = 40
+    # 每轮最大重生成次数 (封顶, 防死循环)
+    max_retries: int = 1
 
 
 class UtteranceConfig(BaseModel):
@@ -194,6 +221,7 @@ class ConversationConfig(BaseModel):
     interruption: InterruptionConfig = Field(default_factory=InterruptionConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
     utterance: UtteranceConfig = Field(default_factory=UtteranceConfig)
+    response_guard: ResponseGuardConfig = Field(default_factory=ResponseGuardConfig)
 
 
 class LoggingConfig(BaseModel):

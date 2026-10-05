@@ -85,7 +85,7 @@ private:
     static void _playTaskEntry(void* arg);
     void _playLoop();
 
-    // 采集块 → AEC 帧 (2000 samples → 6×320 + 余 80)
+    // 采集块 → AEC 帧 (2000 samples → 7×256 + 余 208)
     void _processCaptureChunk(int16_t* chunk, size_t samples);
 
 private:
@@ -109,7 +109,7 @@ private:
     // 采集状态
     volatile bool _captureRunning;
     int16_t* _chunkBuf;             // 2000 samples 采集块
-    int16_t  _frameCarry[80];       // 2000 不能被 320 整除的余量 (80 samples)
+    int16_t  _frameCarry[AEC_FRAME_SAMPLES];  // 跨块帧余量 (最大 AEC_FRAME_SAMPLES-1)
     size_t   _frameCarryLen;
 
     // VAD 状态 (回调去抖)

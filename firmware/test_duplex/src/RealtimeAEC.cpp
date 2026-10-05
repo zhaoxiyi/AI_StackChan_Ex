@@ -1,17 +1,16 @@
 /**
  * @file RealtimeAEC.cpp
- * @brief NLMS 回声消除实现 (ESP32-S3, 纯定点/浮点混合, 无外部依赖)
+ * @brief NLMS 回声消除实现 (test_duplex 测量版)
  *
- * 算法: 时域 NLMS
- *   e[n] = d[n] - y[n]                     (d=麦克风, y=滤波输出)
- *   y[n] = Σ w[k] * x[n-k]                 (x=参考信号=播放历史)
- *   w[k] += mu * e[n] * x[n-k] / (||x||² + eps)
+ * 算法: 时域 NLMS (同主固件)
+ *   e[n] = d[n] - y[n];  y[n] = Σ w[k] * x[n-k];  w[k] += mu*e*x/(||x||²+eps)
  *
- * 双麦说明: CoreS3 的 ES8311 模拟前端把双麦合并为单路 I2S 输入,
- * M5Unified Mic API 是单声道。因此波束成形在现有驱动层面不可获得
- * 独立双通道数据; 本模块按单通道设计, 双麦的模拟电路差分特性
- * 已由硬件完成部分指向性。若未来切换 I2S TDM 双通道采集,
- * 在 processFrame 前叠加差分阵列即可 (接口已预留帧缓冲)。
+ * 播放期对齐 (auto_align): 与主固件一致 — 高能量候选帧对参考环
+ * 粗搜互相关 (bin=1ms) 累加, 每 ~500ms 找峰精搜 ±1ms, 峰均比
+ * >1.6 时更新滤波起点 _k0。bench 延迟扫描时关闭 auto_align。
+ *
+ * 与主固件差异: 无双讲检测/发散保护; 收敛门槛 -15dB;
+ * 噪声门低于 60 RMS 置零 (量化残余, 便于 bench 对比)。
  */
 #include "RealtimeAEC.h"
 #include <math.h>
@@ -19,11 +18,10 @@
 // ---- NLMS 保护常量 ----
 #define NLMS_EPS (1e-6f)
 
-// ---- 噪声门限的帧平滑系数 ----
-#define NOISE_ALPHA (0.9f)
-
 RealtimeAEC::RealtimeAEC()
-    : _w(nullptr), _refHist(nullptr), _refHistPos(0),
+    : _w(nullptr), _refHist(nullptr), _alignLastFrame(nullptr), _alignAccum(nullptr),
+      _refHistPos(0),
+      _k0(0), _alignCount(0), _alignUpdates(0), _aligned(false),
       _speechActive(false), _converged(false),
       _speechStartTick(0), _frameCount(0),
       _resampleAccum(0.0f), _lastResampleSample(0)
@@ -33,8 +31,10 @@ RealtimeAEC::RealtimeAEC()
 
 RealtimeAEC::~RealtimeAEC()
 {
-    if (_w)       { free(_w);       _w = nullptr; }
-    if (_refHist) { free(_refHist); _refHist = nullptr; }
+    if (_w)             { free(_w);             _w = nullptr; }
+    if (_refHist)       { free(_refHist);       _refHist = nullptr; }
+    if (_alignLastFrame){ free(_alignLastFrame);_alignLastFrame = nullptr; }
+    if (_alignAccum)    { free(_alignAccum);    _alignAccum = nullptr; }
 }
 
 bool RealtimeAEC::begin(const AecConfig* cfg)
@@ -46,27 +46,38 @@ bool RealtimeAEC::begin(const AecConfig* cfg)
     _cfg.vad_threshold   = 200.0f;
     _cfg.vad_confirm_ms  = 200;
     _cfg.enable          = true;
+    _cfg.auto_align      = true;
+    _cfg.ref_delay_samples = 0;
     if (cfg) { memcpy(&_cfg, cfg, sizeof(AecConfig)); }
 
-    // 滤波器权重 (float32, 512 taps = 2KB)
     _w = (float*)calloc(AEC_FILTER_TAPS, sizeof(float));
-    // 参考信号历史环 (int16, 512 = 1KB)
     _refHist = (int16_t*)calloc(AEC_HISTORY_SAMPLES, sizeof(int16_t));
-    if (!_w || !_refHist) {
+    _alignLastFrame = (int16_t*)calloc(AEC_FRAME_SAMPLES, sizeof(int16_t));
+    _alignAccum = (float*)calloc(AEC_ALIGN_BINS, sizeof(float));
+    if (!_w || !_refHist || !_alignLastFrame || !_alignAccum) {
         Serial.println("[AEC] malloc failed");
         return false;
     }
 
-    Serial.printf("[AEC] init: mu=%.3f taps=%d confirm=%dms\n",
-                  _cfg.mu, AEC_FILTER_TAPS, (int)_cfg.vad_confirm_ms);
+    _k0 = (_cfg.ref_delay_samples > 0) ? (uint32_t)_cfg.ref_delay_samples : 0;
+    if (_k0 > (uint32_t)(AEC_HISTORY_SAMPLES - AEC_FILTER_TAPS)) {
+        _k0 = (uint32_t)(AEC_HISTORY_SAMPLES - AEC_FILTER_TAPS);
+    }
+
+    Serial.printf("[AEC] init: mu=%.3f taps=%d auto_align=%d k0=%u confirm=%dms\n",
+                  _cfg.mu, AEC_FILTER_TAPS, (int)_cfg.auto_align,
+                  (unsigned)_k0, (int)_cfg.vad_confirm_ms);
     return true;
 }
 
 void RealtimeAEC::reset()
 {
-    if (_w)       memset(_w, 0, AEC_FILTER_TAPS * sizeof(float));
-    if (_refHist) memset(_refHist, 0, AEC_HISTORY_SAMPLES * sizeof(int16_t));
+    if (_w)             memset(_w, 0, AEC_FILTER_TAPS * sizeof(float));
+    if (_refHist)       memset(_refHist, 0, AEC_HISTORY_SAMPLES * sizeof(int16_t));
+    if (_alignLastFrame)memset(_alignLastFrame, 0, AEC_FRAME_SAMPLES * sizeof(int16_t));
+    if (_alignAccum)    memset(_alignAccum, 0, AEC_ALIGN_BINS * sizeof(float));
     _refHistPos = 0;
+    _alignCount = 0;
     _speechActive = false;
     _converged = false;
     _frameCount = 0;
@@ -76,8 +87,6 @@ void RealtimeAEC::pushReference(const int16_t* pcm, size_t samples, int sample_r
 {
     if (!_cfg.enable) return;
 
-    // 播放参考是 24kHz, 处理链路是 16kHz → 3:2 线性重采样
-    // (简单线性插值, 对回声参考信号精度足够)
     if (sample_rate == 24000) {
         const float ratio = 24000.0f / 16000.0f;  // 1.5
         for (size_t i = 0; i < samples; i++) {
@@ -90,7 +99,6 @@ void RealtimeAEC::pushReference(const int16_t* pcm, size_t samples, int sample_r
             }
         }
     } else {
-        // 16kHz: 直接入环
         for (size_t i = 0; i < samples; i++) {
             _refHist[_refHistPos] = pcm[i];
             _refHistPos = (_refHistPos + 1) % AEC_HISTORY_SAMPLES;
@@ -103,7 +111,6 @@ float RealtimeAEC::processFrame(int16_t* frame, bool* has_speech)
     _frameCount++;
     if (has_speech) *has_speech = false;
 
-    // ---- 原始输入 RMS (统计) ----
     float sum = 0.0f;
     for (int i = 0; i < AEC_FRAME_SAMPLES; i++) {
         sum += (float)frame[i] * frame[i];
@@ -112,25 +119,17 @@ float RealtimeAEC::processFrame(int16_t* frame, bool* has_speech)
     _stats.input_rms = input_rms;
 
     if (!_cfg.enable) {
-        // AEC 关闭: 仅做简单能量 VAD
         _stats.residual_rms = input_rms;
         _updateVad(input_rms, has_speech);
         return input_rms;
     }
 
-    // ---- NLMS 自适应滤波 (误差输出) ----
-    // 滤波: 用历史环中最近 512 个参考样本估计回声
-    // 注意: 参考环写指针 _refHistPos 是最新样本的下一位,
-    //       历史顺序为 [_refHistPos, _refHistPos+1, ...] 环形
-    //
-    // 性能: 本帧内参考环不变 (pushReference 由播放任务在帧间调用),
-    //       所以 ||x||² 能量每帧只算一次 (滑动优化, O(512) 而非 O(320×512)),
-    //       权重更新与滤波各 O(320×512), 总计 ≈328K MAC ≈ 1.2ms @240MHz。
+    const int32_t k0 = (int32_t)_k0;
 
-    // 预计算参考能量 ||x||² (每帧一次)
+    // 预计算参考能量 ||x||² (每帧一次, 从 k0 起点)
     float x_norm = 0.0f;
     {
-        int32_t idx = (int32_t)_refHistPos - 1;
+        int32_t idx = (int32_t)_refHistPos - 1 - k0;
         for (int k = 0; k < AEC_FILTER_TAPS; k++) {
             if (idx < 0) idx += AEC_HISTORY_SAMPLES;
             float xk = (float)_refHist[idx];
@@ -142,26 +141,22 @@ float RealtimeAEC::processFrame(int16_t* frame, bool* has_speech)
 
     float residual_sum = 0.0f;
     for (int n = 0; n < AEC_FRAME_SAMPLES; n++) {
-        // 估计回声 y[n] = Σ w[k] * x[n-k] (x[n-1] 是最近样本)
         float y = 0.0f;
-        int32_t idx = (int32_t)_refHistPos - 1;
+        int32_t idx = (int32_t)_refHistPos - 1 - k0;
         for (int k = 0; k < AEC_FILTER_TAPS; k++) {
             if (idx < 0) idx += AEC_HISTORY_SAMPLES;
             y += _w[k] * (float)_refHist[idx];
             idx--;
         }
 
-        // 误差 e[n] = d[n] - y[n] (含回声增益补偿)
         float e = (float)frame[n] - _cfg.echo_gain * y;
 
-        // 限幅防溢出
         if (e > 32767.0f) e = 32767.0f;
         if (e < -32768.0f) e = -32768.0f;
         frame[n] = (int16_t)e;
         residual_sum += e * e;
 
-        // ---- 权重更新 (NLMS, 步长按帧能量归一化) ----
-        idx = (int32_t)_refHistPos - 1;
+        idx = (int32_t)_refHistPos - 1 - k0;
         for (int k = 0; k < AEC_FILTER_TAPS; k++) {
             if (idx < 0) idx += AEC_HISTORY_SAMPLES;
             _w[k] += step * e * (float)_refHist[idx];
@@ -172,33 +167,118 @@ float RealtimeAEC::processFrame(int16_t* frame, bool* has_speech)
     float residual_rms = sqrtf(residual_sum / AEC_FRAME_SAMPLES);
     _stats.residual_rms = residual_rms;
 
-    // ---- 回声衰减估计 (dB) ----
     if (input_rms > 1.0f) {
         float atten = 20.0f * log10f((residual_rms + 1.0f) / (input_rms + 1.0f));
         _stats.echo_attenuation_db = atten;
-        // 收敛判定: 衰减稳定且滤波器有非零权重
         if (atten < -15.0f && _frameCount > 100) {
             _converged = true;
         }
     }
     _stats.frames_processed = _frameCount;
 
-    // ---- 噪声门限降噪 ----
+    // ---- 自动延迟对齐 (互相关估计回波延迟, 噪声门限前调用) ----
+    _autoAlign(frame, input_rms, residual_rms);
+
+    // ---- 噪声门限降噪 (置零, bench 量化残余) ----
     if (residual_rms < _cfg.noise_gate) {
         memset(frame, 0, AEC_FRAME_SAMPLES * sizeof(int16_t));
         residual_rms = 0.0f;
     }
 
-    // ---- VAD (能量 + 过零率) ----
     _updateVad(residual_rms, has_speech);
     return residual_rms;
 }
 
+// ---------------------------------------------------------------------------
+// 自动延迟对齐 (与主固件一致)
+// ---------------------------------------------------------------------------
+
+void RealtimeAEC::_autoAlign(const int16_t* frame, float input_rms, float residual_rms)
+{
+    if (!_cfg.auto_align) return;
+
+    if (input_rms <= 400.0f) return;
+
+    memcpy(_alignLastFrame, frame, AEC_FRAME_SAMPLES * sizeof(int16_t));
+
+    // 互相关 corr(b) = Σ_n frame[n] * ref[base - b*STEP + n]
+    //   ref 索引随 n 同步递增 — 帧内时间对齐 (递减会跨 bin 模糊)
+    int32_t base = (int32_t)_refHistPos - AEC_FRAME_SAMPLES;
+    if (base < 0) base += AEC_HISTORY_SAMPLES;
+    for (int b = 0; b < AEC_ALIGN_BINS; b++) {
+        int32_t idx = base - b * AEC_ALIGN_STEP;
+        float acc = _alignAccum[b];
+        for (int n = 0; n < AEC_FRAME_SAMPLES; n += 2) {
+            int32_t i2 = idx + n;
+            if (i2 < 0) i2 += AEC_HISTORY_SAMPLES;
+            else if (i2 >= AEC_HISTORY_SAMPLES) i2 -= AEC_HISTORY_SAMPLES;
+            acc += (float)frame[n] * (float)_refHist[i2];
+        }
+        _alignAccum[b] = acc;
+    }
+    _alignCount++;
+
+    if (_alignCount >= AEC_ALIGN_EVERY) {
+        _updateDelay();
+        _alignCount = 0;
+        memset(_alignAccum, 0, AEC_ALIGN_BINS * sizeof(float));
+    }
+}
+
+void RealtimeAEC::_updateDelay()
+{
+    float best = 0.0f;
+    int32_t best_b = 0;
+    float mean = 0.0f;
+    for (int b = 0; b < AEC_ALIGN_BINS; b++) {
+        float v = fabsf(_alignAccum[b]);
+        mean += v;
+        if (v > best) { best = v; best_b = b; }
+    }
+    mean /= (float)AEC_ALIGN_BINS;
+    if (mean < 1e-6f || best < mean * 1.6f) return;
+
+    int32_t base = (int32_t)_refHistPos - AEC_FRAME_SAMPLES;
+    if (base < 0) base += AEC_HISTORY_SAMPLES;
+    int32_t center = best_b * AEC_ALIGN_STEP;
+    int32_t hi_max = (int32_t)(AEC_HISTORY_SAMPLES - AEC_FILTER_TAPS);
+    int32_t lo = center - AEC_ALIGN_STEP;   if (lo < 0) lo = 0;
+    int32_t hi = center + AEC_ALIGN_STEP;   if (hi > hi_max) hi = hi_max;
+
+    float best_f = 0.0f;
+    int32_t best_lag = center;
+    for (int32_t lag = lo; lag <= hi; lag++) {
+        int32_t idx = base - lag;
+        float acc = 0.0f;
+        for (int n = 0; n < AEC_FRAME_SAMPLES; n += 2) {
+            int32_t i2 = idx + n;
+            if (i2 < 0) i2 += AEC_HISTORY_SAMPLES;
+            else if (i2 >= AEC_HISTORY_SAMPLES) i2 -= AEC_HISTORY_SAMPLES;
+            acc += (float)_alignLastFrame[n] * (float)_refHist[i2];
+        }
+        if (acc > best_f) { best_f = acc; best_lag = lag; }
+    }
+
+    uint32_t new_k0 = (uint32_t)best_lag;
+    if (new_k0 > (uint32_t)hi_max) new_k0 = (uint32_t)hi_max;
+
+    if (!_aligned || new_k0 > _k0 + 32 || new_k0 + 32 < _k0) {
+        memset(_w, 0, AEC_FILTER_TAPS * sizeof(float));
+        _converged = false;
+    }
+    _k0 = new_k0;
+    _aligned = true;
+    _alignUpdates++;
+
+    if (_alignUpdates <= 3 || _alignUpdates % 10 == 0) {
+        Serial.printf("[AEC] delay aligned: k0=%u (%.1fms) in=%.0f res=%.0f\n",
+                      (unsigned)_k0, (float)_k0 * 1000.0f / 16000.0f,
+                      _stats.input_rms, _stats.residual_rms);
+    }
+}
+
 /**
  * @brief VAD 端点检测 — 能量持续超过阈值 vad_confirm_ms 才确认
- *
- * 关键作用: 全双工播放时, AEC 残余回声若仍有能量, 会被 200ms
- * 确认窗口过滤, 避免本地播放声误触发打断。
  */
 void RealtimeAEC::_updateVad(float rms, bool* has_speech)
 {
@@ -207,13 +287,12 @@ void RealtimeAEC::_updateVad(float rms, bool* has_speech)
     if (rms >= _cfg.vad_threshold) {
         if (!_speechActive) {
             if (_speechStartTick == 0) {
-                _speechStartTick = now;  // 首次超过阈值, 开始计时
+                _speechStartTick = now;
             } else if ((now - _speechStartTick) >= (uint32_t)_cfg.vad_confirm_ms) {
-                _speechActive = true;    // 持续确认 → 人声有效
+                _speechActive = true;
             }
         }
     } else {
-        // 低于阈值: 挂起 500ms 后重置 (容忍句中停顿)
         if (_speechActive && (now - _speechStartTick) > 500) {
             _speechActive = false;
             _speechStartTick = 0;

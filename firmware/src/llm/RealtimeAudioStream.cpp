@@ -95,7 +95,7 @@ void RealtimeAudioStream::_captureLoop()
             continue;
         }
 
-        // AEC + VAD + 回调上传 (块内切成 320-sample 帧)
+        // AEC + VAD + 回调上传 (块内切成 256-sample 帧)
         _processCaptureChunk(_chunkBuf, CAP_CHUNK_SAMPLES);
 
         // 拥塞/速率控制: 网络慢时丢弃旧帧由上层负责,
@@ -107,7 +107,7 @@ void RealtimeAudioStream::_captureLoop()
 
 void RealtimeAudioStream::_processCaptureChunk(int16_t* chunk, size_t samples)
 {
-    // 与上一块余量拼接, 凑成完整 320-sample AEC 帧
+    // 与上一块余量拼接, 凑成完整 AEC 帧 (16ms/256, esp-aec 帧长)
     size_t avail = _frameCarryLen + samples;
     size_t idx = 0;
 
@@ -146,7 +146,7 @@ void RealtimeAudioStream::_processCaptureChunk(int16_t* chunk, size_t samples)
         idx += AEC_FRAME_SAMPLES;
     }
 
-    // 剩余进余量 (samples - idx < 320)
+    // 剩余进余量 (samples - idx < 256)
     if (idx < samples) {
         _frameCarryLen = samples - idx;
         memcpy(_frameCarry, &chunk[idx], _frameCarryLen * sizeof(int16_t));
@@ -162,8 +162,9 @@ void RealtimeAudioStream::submitPlayback(const int16_t* pcm, size_t samples, int
     // 写入环形缓冲 (空间不足时丢弃最旧数据 — 优先实时性)
     // 注意: AEC 参考注入在播放任务实际发声前进行 (见 _playLoop),
     // 保证参考信号与麦克风听到的回声时间对齐 — 若在此处注入,
-    // 参考会比实际发声提前一个环形缓冲深度 (~50-100ms),
-    // 超出 AEC 参考历史 (32ms) 导致回声消除失效。
+    // 参考会比实际发声提前一个环形缓冲深度 (~50-100ms)。
+    // playRaw 内部缓冲/出声时刻的回波延迟由 RealtimeAEC auto_align
+    // 互相关自动估计并补偿 (参考环 256ms, 搜索窗覆盖该延迟)。
     for (size_t i = 0; i < samples; i++) {
         uint32_t next = (_ringHead + 1) % PLAY_RING_SAMPLES;
         if (next == _ringTail) {

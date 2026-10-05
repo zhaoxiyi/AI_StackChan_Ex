@@ -1227,9 +1227,20 @@ static void cmd_aec_bench(bool use_esp)
         if (!g_esp_aec) { Serial.println("[AECB] esp_aec aec_create 失败 (内存?)"); return; }
     }
 
-    Serial.println("[AECB] stage 3: nlms begin...");
+    Serial.println("[AECB] stage 3: nlms begin (auto_align off — 人工扫描参考延迟)...");
     Serial.flush();
-    g_aec.begin(nullptr);
+    {
+        AecConfig aecb_cfg;
+        aecb_cfg.mu = 0.1f;
+        aecb_cfg.echo_gain = 1.0f;
+        aecb_cfg.noise_gate = 60.0f;
+        aecb_cfg.vad_threshold = 200.0f;
+        aecb_cfg.vad_confirm_ms = 200;
+        aecb_cfg.enable = true;
+        aecb_cfg.auto_align = false;    // bench 扫描参考延迟, 关闭自动对齐
+        aecb_cfg.ref_delay_samples = 0;
+        g_aec.begin(&aecb_cfg);
+    }
     Serial.println("[AECB] stage 4: nlms ready");
     g_aecb_tx = 0;
     g_aecb_rx = 0;

@@ -183,6 +183,10 @@ class SenseVoiceSTTEngine(BaseSTT):
         self._cancel = asyncio.Event()
         self._silence_ms: float = 0.0
         self._detected_lang: str = ""
+        # 段能量统计 (触发识别前的“纯噪声段”丢弃判据)
+        self._seg_sum2: float = 0.0      # 段内样本平方和
+        self._seg_n: int = 0             # 段内样本数
+        self._seg_max_rms: float = 0.0   # 段内最大块 RMS
         # recognizer 创建参数 (用于失败时降级重建)
         self._rec_args: dict = {}
         # 运行时自愈标志
@@ -878,9 +882,13 @@ class SenseVoiceSTTEngine(BaseSTT):
         self._feed_count = getattr(self, "_feed_count", 0) + 1
 
         # RMS 静音检测
-        rms_val = float(np.sqrt(np.mean(
-            np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) ** 2
-        )))
+        samples_f = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+        rms_val = float(np.sqrt(np.mean(samples_f ** 2)))
+        # 段能量统计 (用于触发前的噪声段丢弃)
+        self._seg_sum2 += float(np.sum(samples_f ** 2))
+        self._seg_n += len(samples_f)
+        if rms_val > self._seg_max_rms:
+            self._seg_max_rms = rms_val
 
         chunk_ms = len(audio_chunk) / 32.0  # 16kHz * 2B = 32 B/ms
         # 静音阈值: 全双工下 AEC 残余底噪较高 (实测 90-180), 阈值相应提高
@@ -913,7 +921,26 @@ class SenseVoiceSTTEngine(BaseSTT):
         if trigger is None:
             return None
 
-        self._slog(f"触发识别: {trigger} buf={buf_ms:.1f}s RMS={rms_val:.0f}")
+        # 段能量门槛: 整段低能量且无响亮片段 → 纯噪声/残余段, 丢弃不识别
+        # (实测: 安静段被 SenseVoice "编"出无意义文本(如"你让大家都都"),
+        #  白触发一轮 LLM 对话; 人声段 avg 典型 300-2000, 不受影响)
+        avg_rms = (self._seg_sum2 / max(1, self._seg_n)) ** 0.5
+        min_avg = self._config.extra.get("min_speech_rms", 180) if self._config else 180
+        if avg_rms < min_avg and self._seg_max_rms < 500.0:
+            self._slog(
+                f"{trigger} 但段能量过低 (avg={avg_rms:.0f} max={self._seg_max_rms:.0f})"
+                f" → 丢弃不识别"
+            )
+            self._buffer.clear()
+            self._silence_ms = 0.0
+            self._seg_sum2 = 0.0
+            self._seg_n = 0
+            self._seg_max_rms = 0.0
+            return None
+
+        self._slog(
+            f"触发识别: {trigger} buf={buf_ms:.1f}s RMS={rms_val:.0f} avg={avg_rms:.0f}"
+        )
         return await self._recognize(is_final=False)
 
     async def finalize(self) -> Optional[STTResult]:
@@ -921,6 +948,9 @@ class SenseVoiceSTTEngine(BaseSTT):
         if len(self._buffer) < 3200:  # < 100ms
             self._buffer.clear()
             self._silence_ms = 0.0
+            self._seg_sum2 = 0.0
+            self._seg_n = 0
+            self._seg_max_rms = 0.0
             return None
         self._slog(f"最终识别: buf={len(self._buffer)/32.0:.1f}s")
         return await self._recognize(is_final=True)
@@ -931,6 +961,9 @@ class SenseVoiceSTTEngine(BaseSTT):
         pcm = np.frombuffer(bytes(self._buffer), dtype=np.int16).astype(np.float32) / 32768.0
         self._buffer.clear()
         self._silence_ms = 0.0
+        self._seg_sum2 = 0.0
+        self._seg_n = 0
+        self._seg_max_rms = 0.0
         return await self._recognize_pcm(pcm, is_final)
 
     async def _recognize_pcm(self, pcm: np.ndarray, is_final: bool) -> Optional[STTResult]:
@@ -1037,6 +1070,9 @@ class SenseVoiceSTTEngine(BaseSTT):
         self._buffer.clear()
         self._accumulated = ""
         self._silence_ms = 0.0
+        self._seg_sum2 = 0.0
+        self._seg_n = 0
+        self._seg_max_rms = 0.0
         self._feed_count = 0
         self._map_error_count = 0  # 每轮重置计数; _tried_no_itn 保留 (降级持久)
         # 仅在模型已加载时恢复 READY，否则保持原状态 (避免假 READY)

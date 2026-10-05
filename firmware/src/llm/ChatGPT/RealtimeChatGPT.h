@@ -33,6 +33,7 @@ public:   //本当はprivateにしたいところだがコールバック関数�
     //   patch_rx_path(16000) 重建 RX 时钟 → TX/RX 统一 16kHz mono
     //   采集任务: i2s_read → AEC → 上传队列
     //   播放任务: 环形缓冲 → pushReference + i2s_write
+    //     (回波延迟由 RealtimeAEC auto_align 互相关自动对齐, 无需延迟线)
     // ==================================================================
     RealtimeAEC fd_aec;                       // 回声消除
     bool        fd_ready;                     // duplex I2S 就绪
@@ -44,8 +45,8 @@ public:   //本当はprivateにしたいところだがコールバック関数�
     volatile int  fd_up_idx;                  // 采集写入索引
     volatile int  fd_up_len;                  // 当前写入长度 (samples)
     volatile bool fd_up_ready[2];             // 待发标记
-    int16_t       fd_pend_buf[AEC_FRAME_SAMPLES]; // 拼帧缓存 (凑满 20ms 帧再处理)
-    volatile size_t fd_pend_len;              // 拼帧缓存中样本数 (0..320)
+    int16_t       fd_pend_buf[AEC_FRAME_SAMPLES]; // 拼帧缓存 (凑满 16ms 帧再处理)
+    volatile size_t fd_pend_len;              // 拼帧缓存中样本数 (0..256)
 
     // --- 播放 (环形缓冲 + 播放任务) ---
     volatile bool fd_playing;
@@ -63,6 +64,8 @@ public:   //本当はprivateにしたいところだがコールバック関数�
     volatile uint32_t fd_stat_try;         // 窗口内待发块命中次数
     volatile uint32_t fd_stat_ok;          // 窗口内 sendTXT 成功次数
     volatile uint32_t fd_stat_fail;        // 窗口内 sendTXT 失败次数
+    volatile uint32_t fd_stat_aec_us;      // 窗口内 AEC 处理总耗时 (us)
+    volatile uint32_t fd_stat_aec_n;       // 窗口内 AEC 帧数
 #ifdef AEC_DIAG
     // AEC 诊断 (diag 环境): 真实场景 AEC 前/后能量对比
     double   fd_diag_in2 = 0.0;            // AEC 前平方和

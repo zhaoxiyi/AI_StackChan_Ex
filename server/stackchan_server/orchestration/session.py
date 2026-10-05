@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import re
 import time
 import uuid
 from collections.abc import Callable, Awaitable, AsyncIterator
@@ -32,6 +33,7 @@ from .state_machine import (
     ConversationStateMachine, ConversationState, TurnContext,
 )
 from .utterance import UserTextCondenser, CorrectionMemory
+from .response_guard import ResponseGuard, GuardResult
 from ..engines.base import (
     LLMMessage, STTResult, EngineState,
     EngineError, EngineAuthError, EngineTimeoutError, EngineUnavailableError,
@@ -53,6 +55,25 @@ from ..protocol.messages import (
 from ..config import AppConfig, UtteranceConfig, get_config
 from ..logging_config import get_session_logger
 from ..api.admin import publish_event, AdminEvent
+
+
+# =============================================================================
+# think 剥离
+# =============================================================================
+
+def strip_think_text(text: str) -> str:
+    """剥离 qwen3 思考块 <think>...</think>。
+
+    兼容多种形态:
+      1. 成对块 (可多个):  <think>..</think> 连同内容整体移除
+      2. 未闭合标签:       <think>正文.. (量化模型常见) — 只剥标签, 保留内容
+      3. 孤立闭合标签:     </think>
+      4. 带属性标签:       <think reasoning_effort="low">
+    """
+    t = re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.DOTALL)
+    t = re.sub(r"<think\b[^>]*>", "", t)
+    t = re.sub(r"</think>", "", t)
+    return t.strip()
 
 
 # =============================================================================
@@ -80,6 +101,17 @@ class TurnMetrics:
 
 TextDeltaCallback   = Callable[[str], Awaitable[None]]           # 文本增量
 AudioChunkCallback  = Callable[[bytes], Awaitable[None]]         # 音频分片 (PCM/Opus)
+
+
+def _pcm_rms(data: bytes) -> float:
+    """16-bit PCM 块的 RMS (快速估算, array 实现)"""
+    import array as _array
+    n = len(data) // 2
+    if n < 1:
+        return 0.0
+    s = _array.array("h")
+    s.frombytes(data[:n * 2])
+    return (sum(v * v for v in s) / n) ** 0.5
 DeviceEventCallback = Callable[[DeviceEvent], Awaitable[None]]   # 设备指令
 StateChangeCallback = Callable[[ConversationState, TurnContext], Awaitable[None]]  # 状态变化
 
@@ -179,58 +211,73 @@ class ConversationHistory:
         return ""
 
     def set_correction_suffix(self, suffix: str) -> None:
-        """设置追加到 system prompt 的更正信息 (CorrectionMemory 生成)"""
+        """设置用户更正信息 (CorrectionMemory 生成; 注入到动态背景块)"""
         self._correction_suffix = (suffix or "").strip()
 
     # --- 查询 ---
 
     def build_messages(self, max_chars: int = 0) -> list[LLMMessage]:
         """
-        构建发送给 LLM 的完整消息列表 (含字符预算控制)。
+        构建发送给 LLM 的完整消息列表 (分层结构 + 字符预算控制)。
 
-        Context 限制策略:
-          1. 消息数限制: _maybe_truncate 保留最近 max_messages 条
-          2. 字符预算: 从最近的消息往前累计, 超出 max_chars 的更旧消息
-             不硬丢弃 — 拼成一段摘要 (更早对话摘要) 追加到 system prompt,
-             保持上下文连续性同时控制输入长度
-             (中英文按字符数粗估 token: 中文≈1字/1token, 英文≈4字符/1token,
-              预算取 2/3 上下文窗口即可同时保证连贯与低压力)
-          3. 更正记忆: 用户更正记录注入 system prompt, 每轮可见
-          system prompt 永远保留。
+        分层结构 (vLLM prefix cache 友好: 恒定内容在前, 动态内容靠后):
+          [1] system: 恒定引导          — 永不变化 → 始终命中前缀缓存
+          [2] 历史 messages              — 窗口滑动, 天然复用
+          [3] system: 动态背景块          — 更早摘要 → 用户更正
+                                          (仅变化时失效其后的极短片段)
+          [4] user: 当前问题              — 每轮新内容 (必经计算)
+
+        动态内容后置的原因: 旧实现把更正/摘要注入恒定 system (序列最前),
+        任何变化都会导致整个前缀缓存失效、全量重算; 后置后失效面最小。
+        (中英文按字符数粗估 token: 中文≈1字/1token, 英文≈4字符/1token)
 
         Args:
             max_chars: 历史消息字符预算, 0 = 不限制
         """
+        # 1) 恒定引导 (不注入任何动态内容)
         system_msg = LLMMessage(role="system", content=self._system_prompt)
-        if self._correction_suffix:
-            system_msg.content = f"{self._system_prompt}\n\n{self._correction_suffix}"
         msgs = [system_msg]
         msgs.extend(self._messages)
         if self._pending_assistant:
             msgs.append(self._pending_assistant)
 
-        if max_chars <= 0:
+        # 2) 字符预算裁剪 (从最近往前保留; 被挤出者拼摘要, 不硬丢弃)
+        summary = ""
+        if max_chars > 0:
+            total = len(system_msg.content)
+            kept_recent: list[LLMMessage] = []
+            dropped: list[LLMMessage] = []
+            for m in reversed(msgs[1:]):           # 跳过 system
+                c = len(m.content)
+                if kept_recent and total + c > max_chars:
+                    dropped.append(m)
+                    continue
+                total += c
+                kept_recent.append(m)
+            kept_recent.reverse()
+            dropped.reverse()                      # 恢复时间正序
+            summary = self._build_dropped_summary(dropped)
+            msgs = [system_msg] + kept_recent
+
+        # 3) 动态背景块 (更早摘要 → 用户更正; 慢变在前, 频变在后)
+        bg_parts: list[str] = []
+        if summary:
+            bg_parts.append(summary)
+        if self._correction_suffix:
+            bg_parts.append(self._correction_suffix)
+        if not bg_parts:
             return msgs
 
-        # 从最近开始保留, 直到字符预算用尽 (至少保留最近一条)
-        total = len(system_msg.content)
-        kept_recent: list[LLMMessage] = []
-        dropped: list[LLMMessage] = []
-        for m in reversed(msgs[1:]):           # 跳过 system
-            c = len(m.content)
-            if kept_recent and total + c > max_chars:
-                dropped.append(m)
-                continue
-            total += c
-            kept_recent.append(m)
-        kept_recent.reverse()
-        dropped.reverse()                      # 恢复时间正序
-
-        # 被预算挤出的旧消息 → 生成摘要保留, 不硬丢弃
-        summary = self._build_dropped_summary(dropped)
-        if summary:
-            system_msg.content += f"\n\n{summary}"
-        return [system_msg] + kept_recent
+        bg_msg = LLMMessage(role="system", content="\n\n".join(bg_parts))
+        # 插入到最后一条 user 消息之前 (背景服务于当前问题; 其后的内容
+        # 仅剩当前问题本身, 背景变化时的 cache 失效面最小)
+        insert_at = len(msgs)
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].role == "user":
+                insert_at = i
+                break
+        msgs.insert(insert_at, bg_msg)
+        return msgs
 
     def _build_dropped_summary(self, dropped: list[LLMMessage]) -> str:
         """把被字符预算挤出的旧消息拼成简短摘要 (纯规则, 无 LLM 成本)"""
@@ -257,6 +304,18 @@ class ConversationHistory:
             if m.role == "assistant":
                 return m.content
         return ""
+
+    def recent_assistant_texts(self, n: int = 3) -> list[str]:
+        """获取最近 N 条助手回复 (用于 LLM 输出自我复读检测)"""
+        out: list[str] = []
+        for m in reversed(self._messages):
+            if m.role == "assistant":
+                s = m.content.strip()
+                if s:
+                    out.append(s)
+                    if len(out) >= n:
+                        break
+        return out
 
     @property
     def message_count(self) -> int:
@@ -639,6 +698,18 @@ class ConversationSession:
             max_entries=self._cfg.conversation.history.corrections_max
         )
 
+        # LLM 输出复读治理 (检测 + 剔除 + 重生成)
+        _rg = self._cfg.conversation.response_guard
+        self._guard = ResponseGuard(
+            enabled=_rg.enabled,
+            user_echo_min_chars=_rg.user_echo_min_chars,
+            user_echo_ratio=_rg.user_echo_ratio,
+            min_kept_chars=_rg.min_kept_chars,
+            self_repeat_similarity=_rg.self_repeat_similarity,
+            self_repeat_window=_rg.self_repeat_window,
+            self_repeat_short_max=_rg.self_repeat_short_max,
+        )
+
         # 意图路由 + 授权
         self.router = IntentRouter()
         self.auth = AuthorizationManager()
@@ -671,7 +742,9 @@ class ConversationSession:
         self._processing_task: Optional[asyncio.Task] = None  # 当前 LLM 处理任务
         self._interrupt_grace_until: float = 0.0   # 打断宽限期 (committed 后的残留音频不判打断)
         self._audio_started: bool = False          # 本轮是否已开始下发音频 (首次分片重置宽限)
-        self._speaking_last_audio_ts: float = 0.0  # 最近一次下发音频分片的时刻 (播放期不判打断)
+        self._speaking_last_audio_ts: float = 0.0  # 最近一次下发音频分片的时刻 (播放期打断闸门)
+        self._downlink_recent: list = []           # 最近下行片 (ts, rms) — barge-in v1 回声水平估计
+        self._barge_hits: int = 0                  # 播放中插话: 连续超"相对阈值"块计数
         self._last_reply_text: str = ""            # 最近一次回复全文 (回声检测)
         self._last_reply_ts: float = 0.0           # 最近回复时间戳
         self._interrupt_hits: int = 0              # 全双工打断: 连续超 RMS 阈值块计数
@@ -750,15 +823,22 @@ class ConversationSession:
         #   宽限期外的真实用户语音 = 打断; 残余回声由 RMS 阈值
         #   + 连续块确认过滤。半双工固件此期间无上行, 不影响。
         if self.sm.is_speaking:
-            # 播放期间不判打断: 回声与用户语音 RMS 无法区分 (实测回声 8000+),
-            # 但回声只存在于播放时 — 以"最近下发音频"为闸门, 停发 1s 后才放行打断
-            if self._cfg.conversation.interruption.enabled \
-                    and time.time() >= self._interrupt_grace_until \
-                    and time.time() - self._speaking_last_audio_ts >= 1.0 \
-                    and self._voice_activity(audio_data):
-                self._slog.info("SPEAKING 期间检测到用户语音 → 打断 (全双工)")
-                self._interrupt_hits = 0
-                await self.handle_interrupt()
+            # 打断判定 (v1):
+            #   - 近期待播/在播 (距最近下发 < tail_guard_s): 用"相对下行回声"判据
+            #     (AEC 未收敛期回声 10000+, 绝对阈值不可用)
+            #   - 播完且过了尾音保护: 用原绝对阈值判据
+            ir = self._cfg.conversation.interruption
+            if ir.enabled and time.time() >= self._interrupt_grace_until:
+                since_audio = time.time() - self._speaking_last_audio_ts
+                if since_audio < ir.tail_guard_s:
+                    hit = self._barge_in_activity(audio_data)
+                else:
+                    hit = self._voice_activity(audio_data)
+                if hit:
+                    self._slog.info("SPEAKING 期间检测到用户插话 → 打断 (v1)")
+                    self._interrupt_hits = 0
+                    self._barge_hits = 0
+                    await self.handle_interrupt()
             return
 
         # REASONING: committed 后的残留音频在宽限期内忽略;
@@ -823,24 +903,46 @@ class ConversationSession:
         """
         全双工打断 VAD: RMS 阈值 + 连续块确认。
 
-        固件 AEC 后上传的音频中, 残余回声 RMS 低 (噪声门限已清零大部分),
-        用户真实语音 RMS 高 (阈值默认 400, 室内语音典型 300-2000)。
-        连续 N 块超阈值才判定, 过滤短促噪声与 AEC 未收敛时的回声尖峰。
+        (绝对判据; 用于"播完后"时段 — 播放中请用 _barge_in_activity)
         """
-        import array
-        n = len(audio_data) // 2
-        if n < 16:
-            return False
-        samples = array.array("h")
-        samples.frombytes(audio_data[:n * 2])
-        rms = (sum(s * s for s in samples) / n) ** 0.5
-
-        thr = self._cfg.conversation.interruption.speech_rms_threshold
-        if rms >= thr:
+        rms = _pcm_rms(audio_data)
+        ir = self._cfg.conversation.interruption
+        if rms >= ir.speech_rms_threshold:
             self._interrupt_hits += 1
         else:
             self._interrupt_hits = 0
-        return self._interrupt_hits >= self._cfg.conversation.interruption.speech_confirm_blocks
+        return self._interrupt_hits >= ir.speech_confirm_blocks
+
+    def _barge_in_activity(self, audio_data: bytes) -> bool:
+        """
+        播放中插话检测 (barge-in v1): 上行相对"当前下行回声水平"的判据。
+
+        背景: AEC 未收敛期扬声器回声使上行 RMS 达 10000+, 绝对阈值无法
+        区分插话; 但回声幅度随下行内容同步波动, 故用:
+          thr = down_rms × echo_factor × barge_in_ratio + barge_in_floor
+        上行显著超过该阈值并连续确认 → 插话。参数待实测标定 (日志含
+        up/down/thr 三方数值)。
+        """
+        up = _pcm_rms(audio_data)
+        ir = self._cfg.conversation.interruption
+        now = time.time()
+        down = 0.0
+        for ts, r in self._downlink_recent:
+            if now - ts <= 0.5 and r > down:
+                down = r
+        thr = max(down * ir.echo_factor * ir.barge_in_ratio + ir.barge_in_floor,
+                  float(ir.speech_rms_threshold))
+        if up >= thr:
+            self._barge_hits += 1
+        else:
+            self._barge_hits = 0
+        if self._barge_hits >= ir.speech_confirm_blocks:
+            self._slog.info(
+                f"插话候选: up={up:.0f} down={down:.0f} thr={thr:.0f} "
+                f"hits={self._barge_hits}"
+            )
+            return True
+        return False
 
     async def handle_vad_end(self) -> None:
         """
@@ -961,6 +1063,32 @@ class ConversationSession:
                 await self.sm.to_listening()
             except Exception:
                 pass
+
+    async def _generate_once(
+        self, msgs: list[LLMMessage], model_name: str,
+        metrics: TurnMetrics, t_ref: float,
+    ) -> Optional[str]:
+        """单次流式 LLM 生成 (主回复与复读治理重生成共用)。
+
+        Returns:
+            生成全文; 被打断时返回 None (部分文本保留在 history pending)。
+        """
+        full: list[str] = []
+        first_token_logged = False
+        async for chunk in self._llm.feed(msgs):
+            if self._cancel_event.is_set():
+                self._slog.info("LLM 被打断")
+                return None
+            if not first_token_logged:
+                # 仅记录首轮首 token (重生成不覆盖)
+                if not metrics.llm_first_token_ms:
+                    metrics.llm_first_token_ms = (time.time() - t_ref) * 1000
+                first_token_logged = True
+            full.append(chunk)
+            self.history.extend_assistant(chunk)
+            await self._notify_text_delta(chunk)
+            publish_event(AdminEvent(type="llm", text=chunk, speaker="assistant", model=model_name))
+        return "".join(full)
 
     async def _process_utterance(self, user_text: str) -> None:
         """
@@ -1102,27 +1230,11 @@ class ConversationSession:
         t_llm = time.time()
         full_text = ""
         try:
-            full: list[str] = []
-            first_token_logged = False
-            async for chunk in self._llm.feed(msgs):
-                if self._cancel_event.is_set():
-                    self._slog.info("LLM 被打断")
-                    return
-                if not first_token_logged:
-                    metrics.llm_first_token_ms = (time.time() - t_llm) * 1000
-                    first_token_logged = True
-                full.append(chunk)
-                self.history.extend_assistant(chunk)
-                await self._notify_text_delta(chunk)
-                # 发布 LLM 增量到 Admin UI
-                publish_event(AdminEvent(type="llm", text=chunk, speaker="assistant", model=model_name))
-
-            full_text = "".join(full)
+            full_text = await self._generate_once(msgs, model_name, metrics, t_llm)
+            if full_text is None:
+                return          # 已被打断
             metrics.llm_total_ms = (time.time() - t_llm) * 1000
-            # 日志: LLM 回复
-            self._slog.info(
-                f"[LLM←{model_name}] chunks={len(full)} reply={full_text[:120]}"
-            )
+            self._slog.info(f"[LLM←{model_name}] reply={full_text[:120]}")
 
         except EngineUnavailableError:
             full_text = self._degradation_text(model_name)
@@ -1165,18 +1277,7 @@ class ConversationSession:
             return
 
         # ---- 剥离 qwen3 思考块 <think>...</think> ----
-        # qwen3 典型输出: <think>推理</think>\n正文 (闭合标签在中间, 不在文末)
-        # 兼容多种形态:
-        #   1. 成对块 (可多个):  <think>..</think> 连同内容整体移除
-        #   2. 未闭合标签:       <think>正文.. (量化模型常见: 不写闭合标签,
-        #                        此时内容就是正文) — 只剥标签, 保留内容
-        #   3. 孤立闭合标签:     </think> (无开头的残留)
-        #   4. 带属性标签:       <think reasoning_effort="low">
-        import re as _re
-        full_text = _re.sub(r"<think\b[^>]*>.*?</think>", "", full_text, flags=_re.DOTALL)
-        full_text = _re.sub(r"<think\b[^>]*>", "", full_text)
-        full_text = _re.sub(r"</think>", "", full_text)
-        full_text = full_text.strip()
+        full_text = strip_think_text(full_text)
         if not full_text:
             self.history.rollback_assistant()
             self._slog.info("LLM 回复仅含思考块, 丢弃")
@@ -1185,6 +1286,66 @@ class ConversationSession:
             await self._emit_response_done()
             await self.sm.to_listening()
             return
+
+        # ---- LLM 输出复读治理 (检测 + 剔除 + 重生成) ----
+        _rg = self._cfg.conversation.response_guard
+        if _rg.enabled:
+            _recent = self.history.recent_assistant_texts(_rg.self_repeat_window)
+            result = self._guard.guard(full_text, user_text, _recent)
+            retries = 0
+            while result.action == "retry" and retries < _rg.max_retries:
+                self._slog.info(f"复读治理重生成: {result.reason}")
+                # 回滚 pending (被拒回复不入历史), 重试序列附被拒回复+提示
+                self.history.rollback_assistant()
+                self.history.begin_assistant()
+                retry_msgs = msgs + [
+                    LLMMessage(role="assistant", content=full_text),
+                    LLMMessage(role="user", content=result.retry_hint),
+                ]
+                await self._notify_text_delta("\n[Server]: 换个说法…\n")
+                try:
+                    regen = await self._generate_once(retry_msgs, model_name, metrics, t_llm)
+                except Exception as e:
+                    self._slog.warning(f"复读治理重生成失败: {e}")
+                    regen = None
+                if not regen:
+                    # 被打断/异常 → 保底放行原文 (恢复 pending 供后续 commit)
+                    self.history.rollback_assistant()
+                    self.history.begin_assistant()
+                    self.history.extend_assistant(full_text)
+                    result = GuardResult("pass", full_text, "重生成失败, 放行原文", "")
+                    break
+                regen = strip_think_text(regen)
+                if not regen:
+                    self.history.rollback_assistant()
+                    self.history.begin_assistant()
+                    self.history.extend_assistant(full_text)
+                    self._slog.warning("复读治理重生成仅思考块, 放行原文")
+                    result = GuardResult("pass", full_text, "重生成仅思考块, 放行原文", "")
+                    break
+                full_text = regen
+                result = self._guard.guard(full_text, user_text, _recent)
+                retries += 1
+                self._slog.info(f"复读治理重生成 #{retries}: {full_text[:60]}")
+
+            if result.action == "strip":
+                full_text = result.cleaned
+                self._slog.info(f"复读治理剔除: {result.reason}")
+            elif result.action == "retry":
+                # 重试耗尽仍命中: 有可剔除内容则剔除, 否则放行 (可用性优先)
+                if result.cleaned and result.cleaned != full_text:
+                    full_text = result.cleaned
+                    self._slog.info(f"复读治理剔除(重试耗尽): {result.reason}")
+                else:
+                    self._slog.warning(f"复读治理放行(重试耗尽): {result.reason}")
+
+            if not full_text.strip():
+                self.history.rollback_assistant()
+                self._slog.info("复读治理后无有效内容, 丢弃")
+                await self._emit_audio_done()
+                await self._emit_response_done()
+                await self.sm.to_listening()
+                return
 
         self.history.commit_assistant()
         self._slog.info(f"LLM: {full_text[:80]}")
@@ -1257,6 +1418,12 @@ class ConversationSession:
                 self._audio_started = True
                 self._interrupt_grace_until = time.time() + 2.5
             self._speaking_last_audio_ts = time.time()   # 播放期打断闸门
+            # barge-in v1: 记录下行片 RMS (回声水平估计)
+            if len(data) >= 32:
+                self._downlink_recent.append((self._speaking_last_audio_ts,
+                                              _pcm_rms(data)))
+                if len(self._downlink_recent) > 32:
+                    self._downlink_recent = self._downlink_recent[-32:]
             b64 = base64.b64encode(data).decode("ascii")
             ps = self._protocol_session
             await ps.send_json(build_audio_delta(b64))
