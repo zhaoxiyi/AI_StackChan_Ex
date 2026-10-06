@@ -1,74 +1,204 @@
 [English](README_en.md)
 
-# AI Stack-chan Ex
-[![PlatformIO CI](https://github.com/ronron-gh/AI_StackChan_Ex/actions/workflows/platformio-ci.yml/badge.svg)](https://github.com/ronron-gh/AI_StackChan_Ex/actions/workflows/platformio-ci.yml)
+# AI Stack-chan Ex（全双工语音 · 本地服务端版）
 
-robo8080さんの[AIｽﾀｯｸﾁｬﾝ](https://github.com/robo8080/AI_StackChan2)をベースに、次のように機能拡張しています。  
-- AI機能の拡張
-  - Module LLM（M5Stackの拡張モジュール）によるAI会話機能の完全ローカル化
-  - Realtime APIによる遅延のない会話
-- [stackchan-arduinoライブラリ](https://github.com/mongonta0716/stackchan-arduino)に対応
-  - これにより、YAMLによる初期設定や、シリアルサーボへの対応が可能になりました。
-- ユーザアプリケーションを追加作成しやすいクラス設計
+本仓库 fork 自 [ronron-gh/AI_StackChan_Ex](https://github.com/ronron-gh/AI_StackChan_Ex)，该上游项目又基于
+[robo8080/AIｽﾀｯｸﾁｬﾝ](https://github.com/robo8080/AI_StackChan2) 扩展而来。
+本 fork 聚焦一个方向：**低延迟全双工语音对话 + 本地化服务端网关 + 可扩展的对话编排**。
 
-
-> ｽﾀｯｸﾁｬﾝは[ししかわさん](https://x.com/stack_chan)が開発、公開している、手乗りサイズのｽｰﾊﾟｰｶﾜｲｲコミュニケーションロボットです。
->- [Github](https://github.com/stack-chan/stack-chan)
->- [Discord](https://discord.com/channels/1095725099925110847/1097878659966173225)
->- [ScrapBox](https://scrapbox.io/stack-chan/)
-
-<br>
+> ｽﾀｯｸﾁｬﾝ（Stack-chan）是由[ししかわ（Shishikawa）](https://x.com/stack_chan)开发并公开的、
+> 手掌大小的超可爱交流机器人。
+> - [本家仓库](https://github.com/stack-chan/stack-chan)
+> - [Discord](https://discord.com/channels/1095725099925110847/1097878659966173225)
+> - [ScrapBox](https://scrapbox.io/stack-chan/)
 
 ---
-**Table of Contents**
-- [開発環境](#開発環境)
-- [基本的な利用方法](#基本的な利用方法)
-- [Module LLMの利用方法](#module-llmの利用方法)
-- [Realtime APIの利用方法](#realtime-apiの利用方法)
-- [その他の機能](#その他の機能)
-  - [ユーザアプリケーションの作成について](#ユーザアプリケーションの作成について)
-- [コントリビューションについて](#コントリビューションについて)
-  - [本リポジトリの方針](#本リポジトリの方針)
 
+## 目录
 
-## 開発環境
-- ターゲットデバイス：
-  - M5Stack Core2
-  - M5Stack CoreS3
-  - AtomS3R + Atomic Echo Base
-- 開発PC：
-  - OS: Windows11 
-  - IDE：VSCode + PlatformIO
+- [项目来源与演进](#项目来源与演进)
+- [设计思路（本 fork 的改造）](#设计思路本-fork-的改造)
+- [实现途径](#实现途径)
+- [快速开始](#快速开始)
+- [开发环境](#开发环境)
+- [其他功能：用户应用程序（MOD）](#其他功能用户应用程序mod)
+- [已知问题与后续计划](#已知问题与后续计划)
+- [贡献指南](#贡献指南)
+- [文档列表](#文档列表)
 
+---
 
-## 基本的な利用方法
-robo8080さんの[AIｽﾀｯｸﾁｬﾝ](https://github.com/robo8080/AI_StackChan2)の仕組みを継承した基本的なAI会話機能（LLM、STT、TTSのWeb APIの連携によるAI会話）を利用する場合は[こちら](doc/basic_usage.md)のページに従って設定、ビルドしてください。
+## 项目来源与演进
 
-## Module LLMの利用方法
-LLM、STT、TTSをModule LLMのAPIに置き換えることで、AI会話機能を完全ローカル化することができます。  
-上記の[基本的な利用方法](doc/basic_usage.md)をご確認の上、[こちら](doc/module_llm.md)のページに従って設定してください。
+本项目的代码谱系与各阶段的关注点如下：
 
-## Realtime APIの利用方法
-上記の従来のAI会話機能は、STTで音声をテキストに変換→テキストをLLMに入力→LLMのテキスト出力をTTSで音声に変換というステップが必要なため各APIにおける遅延が重なり応答に10秒以上かかっていました。Realtime APIを利用すると、音声データを直接LLMに入力でき、応答も音声データで返ってくるため、遅延を最小限に抑えられます。  
-Realtime APIを利用する際は、[こちら](doc/realtime_api.md)のページに従って設定してください。
+1. **robo8080/AIｽﾀｯｸﾁｬﾝ（AI_StackChan2）**
+   基础版本：通过 LLM / STT / TTS 云 API 组合实现 AI 语音对话，是社区中流传最广的 Arduino 版实现之一。
 
+2. **ronron-gh/AI_StackChan_Ex（上游）**
+   在基础版之上做了三类扩展：
+   - 支持 M5Stack 的 **Module LLM** 扩展模块，将 LLM / STT / TTS 全部本地化；
+   - 支持 **Realtime API**（语音直进直出，显著降低响应延迟）；
+   - 适配 [stackchan-arduino 库](https://github.com/mongonta0716/stackchan-arduino)（YAML 初始化配置、串行舵机），
+     并引入易扩展的用户应用程序（MOD）框架。
 
-## その他の機能
-### ユーザアプリケーションの作成について
-moddable版ｽﾀｯｸﾁｬﾝ（本家と呼ばれている、ししかわさん公開の[リポジトリ](https://github.com/stack-chan/stack-chan)）のMODを参考に、ユーザアプリケーションを作成できるようにしました。
+3. **本仓库（zhaoxiyi fork）**
+   在上游基础上继续改造，核心工作围绕 **全双工语音链路** 与 **自研本地服务端**：
+   - 固件支持"边播边听"的全双工音频流（双 I2S + 自研 NLMS 回声消除 + 自动延迟对齐）；
+   - 对话编排从固件迁移到本地 Python 服务端（STT / LLM / TTS 可替换，逻辑可插拔）；
+   - 新增联网信息助手、双级打断策略、复读治理等对话层能力；
+   - 提供预编译发布版本（`release/`）与调参/设计文档（`doc/`）。
 
-ユーザアプリケーションのソースコードはmodフォルダに格納しており、すでに下表に示すアプリケーションが入っています。
-これらを参考に新たなアプリケーションを作成し追加することも可能です。
+感谢上游作者与社区的开源工作，本仓库的成果同样以开源方式回馈社区。
 
-| No. | アプリ名 | 説明(使い方) | 補足 |
+## 设计思路（本 fork 的改造）
+
+### 1. 为什么把对话搬进本地服务端
+
+上游的 Realtime API 方案由固件直连云端（OpenAI 等）。本 fork 改为：
+
+```
+固件 (M5Stack) ⇄ WebSocket ⇄ 本地服务端 (server/) ⇄ STT / LLM / TTS
+```
+
+- **可替换**：STT 用 SenseVoice（本地 ONNX）、LLM 用 vLLM（默认 qwen3-8b，亦可接 DeepSeek）、
+  TTS 用 edge-tts，全部可配置替换；
+- **可扩展**：复读治理、双级打断、联网助手、未来的记忆系统 / 实时翻译 / MCP 客户端等
+  都作为服务端的编排层能力实现，固件保持轻量；
+- **可调试**：全链路日志、缓存落盘（`server/cache/`），问题可追溯；
+- **协议兼容**：固件与服务端之间使用 OpenAI Realtime 事件协议的子集
+  （`session.update` / `input_audio_buffer.*` / `response.*`），便于理解和迁移。
+  协议细节见 `server/stackchan_server/protocol/`。
+
+### 2. 全双工语音（边播边听）
+
+- 固件侧：采集与播放使用独立 I2S 通道并行工作；自研 **NLMS 回声消除**（逐样本滑窗能量归一化，
+  解决了帧内冻结与帧级归一化发散两个根本缺陷）与 **auto_align 自动延迟对齐**（实测回声路径延迟约 124ms）；
+- 服务端侧：能量门槛 + 静音断句（SenseVoice 连续识别）；
+- 效果：设备播报期间持续上传 AEC 后的上行音频，用户可**随时开口打断**。
+
+### 3. 双级打断策略（hard / soft）
+
+- **hard（直接打断）**：上行能量显著超过"当前下行回声水平"（相对判据
+  `thr = down × echo_factor × ratio + floor`），连续命中确认后立即停播并进入聆听；
+- **soft（追问确认）**：命中较弱级别时先追问"嗯，是在跟我说什么吗？"并暂停原播报，
+  观察窗内用户继续说话则正式打断，无回应则自动继续原播报；
+- 抗误触发设计：5 中 3 块命中确认、下行参考取"设备当前正在播的内容"（覆盖环形缓冲的播放滞后）、
+  追问合成走后台任务（不阻塞音频接收循环）；
+- 关键参数与调参记录（含 AEC 能量门槛）见 [doc/duplex_voice_tuning.md](doc/duplex_voice_tuning.md)。
+
+### 4. 复读治理（输出侧）
+
+- **复读用户**：回复开头复述用户问句 → 自动剔除；
+- **自我复读**：与近期回复重复（含"完全相同"快速通道）→ 自动重生成；
+- **打断恢复**：被打断的部分回复以"（被打断，部分内容未播报…）"标注进入上下文，
+  用户后续问起时可由 LLM 补充播报。
+
+### 5. 联网信息助手（后台异步搜索）
+
+- 识别到联网意图后转**后台异步搜索**，不阻塞当前对话；
+- 搜索进行中通过 Prompt 槽位告知模型"还在查"，严禁编造结果；
+- 用户说"把查出来的内容播报一下"即可回流播报；结果落盘缓存（`server/cache/web_queries/`）备查；
+- 搜索源可配置（默认 BingCN，支持 DuckDuckGo / SearXNG）。
+
+### 6. Prompt 分层组合（prefix cache 友好）
+
+发送给 LLM 的消息按如下层次组装（恒定内容在前、动态内容靠后）：
+
+```
+[1] system 恒定引导（永不变化 → 始终命中 vLLM 前缀缓存）
+[2] 历史消息（窗口滑动）
+[3] system 动态背景块（更早摘要 → 用户更正 → 后台任务槽位）
+[4] user 当前问题
+```
+
+实现见 `server/stackchan_server/orchestration/session.py` 的 `ConversationHistory.build_messages()`。
+
+## 实现途径
+
+### 目录结构
+
+- `firmware/` —— 固件工程（PlatformIO）：全双工音频、AEC、Realtime 会话、MOD 应用框架
+- `server/` —— 本地服务端（Python / FastAPI）：对话编排、STT / LLM / TTS 引擎、协议层
+- `Copy-to-SD/` —— SD 卡配置文件（YAML 初始化、应用配置）
+- `release/` —— 预编译发布版本（见下方"快速开始"）
+- `doc/` —— 使用文档与设计文档（见文末列表）
+
+### 固件侧要点
+
+- 目标设备：**M5Stack CoreS3**（主要验证）、M5Stack Core2、AtomS3R + Atomic Echo Base；
+- PlatformIO 环境：`m5stack-cores3-realtime`（全双工模式）；
+  诊断环境 `m5stack-cores3-realtime-diag`（`-DAEC_DIAG`，输出 `[FD] aec2s:` 能量诊断行）；
+- 关键模块：
+  - `src/llm/RealtimeAudioStream.cpp` —— 全双工采集 / 播放任务
+  - `src/llm/RealtimeAEC.cpp/.h` —— NLMS 回声消除（含 auto_align）
+  - `src/llm/RealtimeLLMBase.cpp` / `src/llm/ChatGPT/RealtimeChatGPT.cpp` —— 会话主循环与事件分发
+  - `src/mod/` —— MOD 应用框架（见下文）
+
+### 服务端侧要点
+
+- Python 3.11+，FastAPI + Uvicorn（WebSocket）；
+- 引擎：STT = SenseVoice（本地 ONNX，可换 whisper）、LLM = vLLM / DeepSeek、TTS = edge-tts；
+- 关键模块：
+  - `orchestration/session.py` —— 对话编排（Prompt 组合 / 打断 / 保活 / 流水线）
+  - `orchestration/response_guard.py` —— 复读治理
+  - `orchestration/web_query.py` —— 联网信息助手
+  - `orchestration/state_machine.py` —— 会话状态机（IDLE / LISTENING / REASONING / SPEAKING）
+  - `protocol/` —— Realtime 事件协议（与固件对接）
+
+## 快速开始
+
+### 1. 启动服务端
+
+```bash
+cd server
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+# 按需编辑 config.yaml：vLLM 地址（vllm.base_url）、STT 模型路径、TTS 音色等
+.venv/bin/python -m stackchan_server.main
+```
+
+服务默认监听 `0.0.0.0:8080`（WebSocket 端点 `/v1/realtime`）。
+
+### 2. 准备 SD 卡与固件
+
+- 将 `Copy-to-SD/` 下的内容复制到 SD 卡根目录（Wi-Fi、伺服等初始化配置在 YAML 中完成）；
+- 编译烧录：
+
+```bash
+cd firmware
+~/.platformio/penv/bin/pio run -e m5stack-cores3-realtime -t upload
+```
+
+- 或直接使用预编译版本：`release/AiStackChanEx-FullDuplexOnly-v0.6/`
+  （含合并镜像与分文件、SHA256SUMS，详见该目录内 README）。
+
+### 3. 开始使用
+
+- 触摸屏幕开始 / 结束录音；
+- 播报过程中可随时开口打断（hard 直接打断 / soft 追问确认）；
+- 联网类问题自动转后台搜索，答复"播报一下"即可听取结果。
+
+## 开发环境
+
+- 目标设备：M5Stack Core2 / M5Stack CoreS3 / AtomS3R + Atomic Echo Base
+- 开发 PC：Windows 11 或 Linux；VSCode + PlatformIO
+- 服务端：Python 3.11+，可访问本地 vLLM（或配置 DeepSeek API Key）
+
+## 其他功能：用户应用程序（MOD）
+
+参考 moddable 版本家ｽﾀｯｸﾁｬﾝ的 MOD 设计，本仓库支持创建与切换用户应用程序。
+源代码位于 `firmware/src/mod/`，已内置以下应用：
+
+| No. | 应用名 | 说明（用法） | 备注 |
 | --- | --- | --- | --- |
-| 1 | AIｽﾀｯｸﾁｬﾝ | 本リポジトリのメインアプリです。 | |
-| 2 | ポモドーロタイマ | 25分のアラームと5分のアラームを交互に繰り返すアプリです。<br>ボタンA：スタート/ストップ<br>ボタンC：無音モード解除/設定 | 初期状態は無音モードです。|
-| 3 | デジタルフォトフレーム | SDカードのフォルダ "/app/AiStackChanEx/photo" に保存したJPEGファイルをLCDに表示します。<br>ボタンA：次の写真を表示 <br>ボタンC：スライドショー開始 | ・SDカードに保存するJPEGファイルはサイズを320x240にしておく必要があります。<br>・開発中、SDカードがマウント不可になり、再フォーマットしないと復旧しない事象が発生していました。改善したつもりですが、念のためSDカードのデータはバックアップをお願いします。|
-| 4 | ステータスモニタ | 各種システム情報を表示します。| |
-| 5 | ESP-NOW Remote Control | M5Stack公式ｽﾀｯｸﾁｬﾝのオプションのジョイスティックコントローラから受信した姿勢データでサーボを制御します。<br>受信channelは1固定です。 | ESP-NOW使用中はWi-Fi接続が切断されます。別Modへ切り替えるとWi-Fiの再接続を試みます。 |
+| 1 | AIｽﾀｯｸﾁｬﾝ | 本仓库的主应用（AI 语音对话） | |
+| 2 | 番茄钟 | 25 分钟与 5 分钟闹钟交替循环。<br>按钮A：开始/停止；按钮C：解除/设置静音 | 初始为静音模式 |
+| 3 | 数码相框 | 显示 SD 卡目录 `/app/AiStackChanEx/photo` 中的 JPEG 图片。<br>按钮A：下一张；按钮C：开始幻灯片 | JPEG 需预先调整为 320×240；<br>曾出现 SD 卡不可挂载需重新格式化的问题，请备份数据 |
+| 4 | 状态监视器 | 显示各类系统信息 | |
+| 5 | ESP-NOW 遥控 | 使用 M5Stack 官方ｽﾀｯｸﾁｬﾝ选配摇杆手柄的姿势数据控制舵机。<br>接收 channel 固定为 1 | ESP-NOW 使用期间 Wi-Fi 断开；切换其他 Mod 后会自动尝试重连 |
 
-アプリケーションは下記コードのように記述することで複数登録できます。実行中にLCDを左右にフリックすることで切り替えることができます（[Xの動画](https://x.com/motoh_tw/status/1841867660746789052)）。
+按下述方式注册多个应用，运行时在 LCD 上左右滑动即可切换（[演示视频](https://x.com/motoh_tw/status/1841867660746789052)）：
 
 ```c++
 [main.cpp]
@@ -76,29 +206,66 @@ ModBase* init_mod(void)
 {
   ModBase* mod;
   add_mod(new AiStackChanMod());      // AI Stack-chan
-  add_mod(new PomodoroMod());         // Pomodoro Timer
-  add_mod(new StatusMonitorMod());    // Status Monitor
+  add_mod(new PomodoroMod());         // 番茄钟
+  add_mod(new StatusMonitorMod());    // 状态监视器
   mod = get_current_mod();
   mod->init();
   return mod;
 }
 ```
 
+## 已知问题与后续计划
 
-## コントリビューションについて
-issue、プルリクエストも歓迎です。問題や改善案がありましたら、まずはissueでご連絡ください。  
-また、Sponsorとしてご支援いただけると大変助かります。日々のトラブルシューティング、お問い合わせへの対応、新しいハードウェアのサポートなどに役立てさせていただきます。  
-ご支援いただく際は、次に示す本リポジトリの方針もご理解いただけますと幸いです。
+### 已知问题
 
-### 本リポジトリの方針
-現状、趣味の範囲での活動ではありますが、次のような方針のもとに開発しています。
+- **全双工回声残余**：播报期间上行仍存在一定量级的 AEC 残余能量，个别场景会影响打断判定
+  （表现为误触发或打不断），根因仍在排查中；现有调参记录与诊断方法见
+  [doc/duplex_voice_tuning.md](doc/duplex_voice_tuning.md)。
 
-- AI音声アシスタントとしての性能の追求  
-  生成AI関連のニュースが次々と発表され、ｽﾀｯｸﾁｬﾝをAI音声アシスタントとして実用的なレベルに近づけられる可能性が高まっています。これまでの開発でリアルタイム音声会話、MCPによる機能拡張を実現しており、今後は長期記憶（電源を入れなおしても最近の会話内容を覚えている）の実装を目指しています。
-- 派生開発のベースとしての公開  
-  本リポジトリの成果をたくさんの方々のAIｽﾀｯｸﾁｬﾝ開発のベースとして役立てていただけるよう、シンプルで汎用的な設計を目指しています。
-- 新しいハードウェアへの対応  
-  上記の方針に影響しない範囲で、ModuleLLMのような今後の発展が期待できる新しいハードウェアもカバーしていきたいと考えています。
-- 本家ｽﾀｯｸﾁｬﾝ リポジトリへの貢献  
-  本リポジトリは、いわゆる「本家」や「TypeScript版」と呼ばれるししかわ氏の[リポジトリ](https://github.com/stack-chan/stack-chan)をリスペクトし、一部の設計はその影響を受けています。本リポジトリで得られた成果を用いて、本家ｽﾀｯｸﾁｬﾝの発展にも貢献したいと考えています（私がTypeScriptのスキルがないため、現状はあまり実現できていません。スキルのある方はぜひご検討ください）。
+### 后续计划（详见 [doc/next_stage_design.md](doc/next_stage_design.md)）
 
+1. **实时翻译模式**：持续收听并逐段翻译（随收听内容累积不断修正），翻译结果实时落盘并展示；
+2. **服务端 MCP 客户端**：将工具调用从固件迁移到服务端（vLLM function calling），接入 MCP 生态；
+3. **长期记忆**：跨重启记住近期对话内容；
+4. **联网信息助手增强**：多任务并行搜索、结果回唤（结合记忆系统）；
+5. **外部 Agent / Harness 调度接口预留**（需显式授权后启用）。
+
+## 贡献指南
+
+欢迎 issue 与 pull request。如有问题或改进建议，请先通过 issue 联系。
+如果愿意以 Sponsor 形式支持本项目，将用于日常问题排查、咨询响应与新硬件适配等工作。
+
+### 本仓库的方针
+
+- **追求 AI 语音助手的实用性能**：围绕实时语音对话、低延迟与长期记忆持续演进，让ｽﾀｯｸﾁｬﾝ更接近实用级 AI 助手；
+- **作为派生开发的基座**：保持简单、通用的设计，让本仓库的成果能服务于更多人的 AIｽﾀｯｸﾁｬﾝ开发；
+- **跟进新硬件**：在不影响上述方针的范围内，覆盖 Module LLM 等有发展潜力的新硬件；
+- **回馈本家社区**：尊重并借鉴本家（ししかわ氏）与本仓库上游的设计，
+  并希望将成果用于本家ｽﾀｯｸﾁｬﾝ的发展。
+
+## 文档列表
+
+### 基础使用与配置
+
+- [basic_usage.md](doc/basic_usage.md) / [English](doc/basic_usage_en.md) —— 基本使用方法（LLM / STT / TTS API 联动）
+- [module_llm.md](doc/module_llm.md) / [English](doc/module_llm_en.md) —— 使用 Module LLM 实现完全本地化对话
+- [realtime_api.md](doc/realtime_api.md) / [English](doc/realtime_api_en.md) —— Realtime API 使用方法
+- [custom_endpoint.md](doc/custom_endpoint.md) / [English](doc/custom_endpoint_en.md) —— 自定义 API 端点
+- [sd_updater.md](doc/sd_updater.md) / [English](doc/sd_updater_en.md) —— SD 卡更新方法
+- [atoms3r.md](doc/atoms3r.md) —— AtomS3R + Atomic Echo Base 使用说明
+- [tts_aquestalk.md](doc/tts_aquestalk.md) —— AquesTalk TTS 说明
+- [wakeword_simple_vox.md](doc/wakeword_simple_vox.md) / [English](doc/wakeword_simple_vox_en.md) —— 唤醒词（SimpleVox）
+
+### 功能扩展
+
+- [mcp.md](doc/mcp.md) / [English](doc/mcp_en.md) —— MCP（Model Context Protocol）集成
+- [function_calling.md](doc/function_calling.md) / [English](doc/function_calling_en.md) —— 函数调用
+- [scheduler.md](doc/scheduler.md) —— 定时任务（Scheduler）
+- [gpt4o_cores3camera.md](doc/gpt4o_cores3camera.md) / [English](doc/gpt4o_cores3camera_en.md) —— CoreS3 摄像头 + GPT-4o
+
+### 本 fork 新增（全双工 / 服务端）
+
+- [duplex_voice_tuning.md](doc/duplex_voice_tuning.md) —— 全双工语音调优记录
+  （AEC 缺陷修复、auto_align、打断策略与能量门槛的关键参数说明）
+- [next_stage_design.md](doc/next_stage_design.md) —— 下一阶段设计
+  （联网信息助手 / 实时翻译模式 / Harness 调度接口）

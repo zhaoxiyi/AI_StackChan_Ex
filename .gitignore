@@ -17,5 +17,8 @@ firmware/test_duplex/libextra/
 # --- CodeWhale 运行时 ---
 .codewhale/
 
+# --- 服务端运行时缓存 (联网查询结果落盘) ---
+server/cache/
+
 # --- 音频测试产物 ---
 server/tts_check_16k.wav
