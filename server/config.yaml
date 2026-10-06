@@ -170,12 +170,16 @@ conversation:
     strategy: "immediate_stop"        # immediate_stop | fade_out
     # 全双工语音打断: SPEAKING 期间检测用户语音 (固件 AEC 后音频)
     speech_rms_threshold: 400         # RMS 阈值 (16bit PCM, 室内语音典型 300-2000)
-    speech_confirm_blocks: 3          # 连续超阈值块数 (~125ms/块) 去抖 | queue
+    speech_confirm_blocks: 3          # 最近 5 块中命中块数 (5中3 确认, 允许 1-2 块断裂)
     # 播放中插话 (barge-in v1: 相对下行回声判据;
-    # AEC 未收敛期回声 10000+, 绝对阈值不可用)
-    tail_guard_s: 0.4                 # 下行停止后尾音保护时长
-    echo_factor: 0.8                  # 回声水平估计系数 (下行 RMS × 系数)
-    barge_in_ratio: 1.6               # 上行需超过回声估计的倍数
+    # 2026-10 二轮实测: 残余比 ~1.85-2.5, 用户说话 up/down ≈ 2.6-4.0
+    # (3.2x 时代需要"靠近 Mic"才能触发 soft, hard 始终不触发)
+    tail_guard_s: 2.5                 # 下行停止后"相对判据"保护时长: 覆盖固件环形缓冲
+                                      #   播放滞后 ~1-3s; 此内用相对判据 (滑窗峰值) 防
+                                      #   残余误触发, 之后才用绝对阈值保打断灵敏度
+    echo_factor: 2.0                  # 回声水平估计系数 (下行 RMS × 系数)
+    barge_in_ratio: 1.2               # hard 级 (综合 2.4x → 直接打断)
+    probe_ratio: 1.05                 # 中间级 (综合 2.1x → 追问后观察再定)
     barge_in_floor: 400               # 判据绝对底线
   
   # Conversation history
@@ -200,6 +204,20 @@ conversation:
     submit_punctuation: "。！？!?.;…"  # 句末标点 = 语句完整 → 立即提交
     submit_min_chars_no_punct: 15     # 无标点时累积多少字才提交
     max_pending_chars: 100            # 累积上限, 强制提交
+
+# ---------------------------------------------------------------------------
+# Web Query Configuration (联网信息助手: 后台异步搜索, 免 approve)
+# ---------------------------------------------------------------------------
+web_query:
+  enabled: true
+  provider: "bingcn"                 # bingcn (国内可达, 默认) | ddg | searxng (自建/内网)
+  endpoint: "http://localhost:8080/search"   # searxng 地址 (provider=searxng 时)
+  proxy: ""                          # 可选 HTTP 代理 (出网受限时填, 如 http://host:port)
+  max_results: 5                     # 取前 N 条结果
+  inline_wait_s: 2.5                 # 本轮内联等待上限 (快查询直接带答案)
+  timeout_s: 120                     # 后台任务放弃时限 (过期→expired, 落盘保留)
+  summary_max_tokens: 256            # LLM 提炼输出上限
+  cache_dir: "cache"                 # 落盘根目录: cache/web_queries/<时间戳>_<slug>.json
 
 # ---------------------------------------------------------------------------
 # Logging Configuration

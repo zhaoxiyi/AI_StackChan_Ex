@@ -111,8 +111,22 @@ class ResponseGuard:
 
         # ---- 2) 自我复读检测 (对最终候选文本判定) ----
         candidate = cleaned if echo_detected else r
-        recent = [x for x in (recent_replies or []) if x.strip()]
+        # 历史中的"(被打断…)"等标注后缀会稀释相似度 (如 0.93<0.95 漏拦), 比较前剥离
+        recent = [re.sub(r"\s*\(被打断[^)]*\)\s*$", "", x.strip())
+                  for x in (recent_replies or []) if x.strip()]
         if recent:
+            # 完全相同 (规范化后) → 直接拦截: 不依赖相似度阈值与长度豁免。
+            # (历史案例: 标注后缀/细微改写会把相似度压到阈值以下导致漏拦)
+            cand_norm = _PUNCT_WS_RE.sub("", candidate)
+            for prev in recent:
+                if cand_norm and cand_norm == _PUNCT_WS_RE.sub("", prev):
+                    return GuardResult(
+                        action="retry",
+                        cleaned=cleaned,
+                        reason="自我复读 (完全相同)",
+                        retry_hint="你刚才的回复和之前的回答一字不差。"
+                                   "请换个说法，或者补充新的信息，不要重复之前说过的话。",
+                    )
             sim = max(self.similarity(candidate, prev) for prev in recent)
             # 短回复: 相似度门槛即可; 长回复: 仅"几乎逐字重复"(≥0.95)才拦截
             # (长回复重生成成本高, 但"答非所问式重复上一轮"体验极差)

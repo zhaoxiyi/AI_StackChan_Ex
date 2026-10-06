@@ -76,6 +76,11 @@ r = g.guard("好的呀，语音状态我看过了，挺正常的。还有什么�
             "停婷。", [_LONG])
 check("长回复小改写 → pass", r.action, "pass")
 
+r = g.guard(_LONG, "停婷。",
+            [_LONG + " (被打断, 部分内容未播报; 若用户后续问及此内容, "
+                     "可用'我之前想说这个来着'开头补充)"])
+check("带被打断标注的重复回复 → 仍拦截", r.action, "retry")
+
 r = g.guard("好的呢。", "随便说点什么吧", ["今天天气不错,适合出门散步。"])
 check("与近期回复无关 → pass", r.action, "pass")
 
@@ -91,6 +96,14 @@ check("复读+自我复读双命中 → retry", r.action, "retry")
 
 r = g.guard("", "今天天气怎么样", [])
 check("空回复 pass", r.action, "pass")
+
+# ---- 完全相同 (规范化后) → 不受长度豁免影响, 直接拦截 ----
+# (现场案例: 53 字长回复连续多轮一字不差, 纯相似度路径依赖阈值余量)
+r = g.guard(_LONG, "讲个故事吧。", [_LONG])
+check("长回复完全相同 → 直接拦截", r.action, "retry")
+
+r = g.guard(_LONG + "  ", "讲个故事吧。", [" " + _LONG])
+check("完全相同(仅空白差异) → 直接拦截", r.action, "retry")
 
 g2 = ResponseGuard(enabled=False)
 r = g2.guard("今天天气怎么样?", "今天天气怎么样", [])

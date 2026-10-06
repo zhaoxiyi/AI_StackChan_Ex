@@ -155,15 +155,24 @@ class InterruptionConfig(BaseModel):
     # 音频 RMS 阈值: AEC 后上传的音频中, 残余回声低于此值,
     # 用户真实语音高于此值 (16bit PCM, 室内语音典型 300-2000)
     speech_rms_threshold: int = 400
-    # 连续超阈值块数 (每块 ~125ms): 去抖, 防短促噪声误触发
+    # 最近 5 块中命中块数阈值 (每块 ~125ms): 5中3 确认 — 允许用户说话
+    # 音节起伏造成的 1-2 块断裂 (旧"连续 3 块"实测打不断)
     speech_confirm_blocks: int = 3
     # ---- 播放中插话 (barge-in v1: 相对下行回声判据) ----
-    # AEC 未收敛期回声使上行 RMS 达 10000+, 绝对阈值无法区分插话;
-    # 但回声幅度随下行内容同步波动, 故采用"上行显著超过下行回声估计"判据:
+    # AEC 后残余与下行响度成正比 (纯回声实测 up/down ≈ 2.7~2.9),
+    # 故采用"上行显著超过下行回声估计"判据:
     #   thr = down_rms × echo_factor × barge_in_ratio + barge_in_floor
-    tail_guard_s: float = 0.4          # 下行停止后尾音保护时长 (此内不判打断)
-    echo_factor: float = 0.8           # 回声水平估计系数 (下行片 RMS × 系数)
-    barge_in_ratio: float = 1.6        # 上行需超过回声估计的倍数
+    # 系数取值权衡: 过大 (3.8x) → 用户说话也打不断 (实测失效); 过小 → 纯残余
+    # 易误触发。2026-10 二轮实测: 残余比 ~1.85-2.5、用户说话 up/down ≈ 2.6-4.0,
+    # 取 2.1/2.4 并辅以 5中3 确认 (soft 误触发有 1.5s 自动恢复兜底)
+    tail_guard_s: float = 2.5          # 下行停止后"相对判据"保护时长 (覆盖固件环形缓冲
+                                       #   播放滞后 ~1-3s; 此内用相对判据防残余误触发,
+                                       #   之后用绝对阈值判据保打断灵敏度)
+    echo_factor: float = 2.0           # 回声水平估计系数 (实测回声路径 ~2.7-4x, 取 2.0 配合 ratio)
+    barge_in_ratio: float = 1.2        # hard 级: 综合 2.4x → 直接打断 (三轮实测降档:
+                                       #   2.7x 仍有多半"非靠近/轻声"块够不着)
+    probe_ratio: float = 1.05          # 中间级 (soft): 综合 2.1x → 先追问"是在跟我说什么吗?",
+                                       #   观察窗内再次命中则正式打断, 否则继续播报原内容
     barge_in_floor: float = 400.0      # 判据绝对底线 (防下行小时误触发)
 
 
@@ -224,6 +233,19 @@ class ConversationConfig(BaseModel):
     response_guard: ResponseGuardConfig = Field(default_factory=ResponseGuardConfig)
 
 
+class WebQueryConfig(BaseModel):
+    """联网信息助手 (后台异步搜索; 免 approve)"""
+    enabled: bool = True
+    provider: str = "bingcn"           # bingcn (国内可达, 默认) | ddg | searxng
+    endpoint: str = "http://localhost:8080/search"   # searxng 地址
+    proxy: str = ""                    # 可选 HTTP 代理 (如 http://host:port; 空=直连)
+    max_results: int = 5               # 取前 N 条结果
+    inline_wait_s: float = 2.5         # 本轮内联等待上限 (快查询直接带答案)
+    timeout_s: float = 120.0           # 后台任务放弃时限 (过期标记 expired)
+    summary_max_tokens: int = 256      # LLM 提炼输出上限
+    cache_dir: str = "cache"           # 落盘根目录 (相对 server 运行目录)
+
+
 class LoggingConfig(BaseModel):
     """日志配置"""
     level: str = "INFO"
@@ -245,6 +267,7 @@ class AppConfig(BaseModel):
     stt: STTConfig = Field(default_factory=STTConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
+    web_query: WebQueryConfig = Field(default_factory=WebQueryConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 

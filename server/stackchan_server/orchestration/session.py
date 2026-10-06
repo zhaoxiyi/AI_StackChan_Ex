@@ -34,6 +34,7 @@ from .state_machine import (
 )
 from .utterance import UserTextCondenser, CorrectionMemory
 from .response_guard import ResponseGuard, GuardResult
+from .web_query import WebQueryManager
 from ..engines.base import (
     LLMMessage, STTResult, EngineState,
     EngineError, EngineAuthError, EngineTimeoutError, EngineUnavailableError,
@@ -50,7 +51,7 @@ from ..protocol.messages import (
     build_audio_delta, build_audio_done,
     build_audio_transcript_delta, build_text_delta,
     build_response_done, build_audio_buffer_committed,
-    build_speech_stopped,
+    build_speech_started, build_speech_stopped,
 )
 from ..config import AppConfig, UtteranceConfig, get_config
 from ..logging_config import get_session_logger
@@ -140,7 +141,8 @@ class ConversationHistory:
         self._summary_budget = max(80, summary_budget_chars)
         self._messages: list[LLMMessage] = []
         self._pending_assistant: Optional[LLMMessage] = None  # 正在生成中的助手消息
-        self._correction_suffix: str = ""   # 更正记忆注入文本 (追加到 system prompt)
+        self._correction_suffix: str = ""   # 更正记忆注入文本 (动态背景块)
+        self._web_suffix: str = ""          # 后台任务槽位文本 (动态背景块, 变得最快)
 
     # --- 增删 ---
 
@@ -197,7 +199,8 @@ class ConversationHistory:
         if text:
             self._messages.append(LLMMessage(
                 role="assistant",
-                content=text + " (被打断)",
+                content=text + " (被打断, 部分内容未播报; 若用户后续问及此内容, "
+                              "可用'我之前想说这个来着'开头补充)",
             ))
         self._pending_assistant = None
         self._maybe_truncate()
@@ -213,6 +216,10 @@ class ConversationHistory:
     def set_correction_suffix(self, suffix: str) -> None:
         """设置用户更正信息 (CorrectionMemory 生成; 注入到动态背景块)"""
         self._correction_suffix = (suffix or "").strip()
+
+    def set_web_suffix(self, suffix: str) -> None:
+        """设置后台任务槽位文本 (联网助手; 每轮刷新, 播报后自然消失)"""
+        self._web_suffix = (suffix or "").strip()
 
     # --- 查询 ---
 
@@ -259,12 +266,14 @@ class ConversationHistory:
             summary = self._build_dropped_summary(dropped)
             msgs = [system_msg] + kept_recent
 
-        # 3) 动态背景块 (更早摘要 → 用户更正; 慢变在前, 频变在后)
+        # 3) 动态背景块 (更早摘要 → 用户更正 → 后台任务; 慢变在前, 频变在后)
         bg_parts: list[str] = []
         if summary:
             bg_parts.append(summary)
         if self._correction_suffix:
             bg_parts.append(self._correction_suffix)
+        if self._web_suffix:
+            bg_parts.append(self._web_suffix)
         if not bg_parts:
             return msgs
 
@@ -714,6 +723,11 @@ class ConversationSession:
         self.router = IntentRouter()
         self.auth = AuthorizationManager()
 
+        # 联网信息助手 (后台异步搜索; 结果经 [后台任务] 槽位回流播报)
+        self._web = WebQueryManager(
+            self._cfg.web_query, self.session_id, llm_getter=lambda: self._llm,
+            log_fn=self._slog.info)
+
         # 动效
         self.animator = AnimationOrchestrator()
 
@@ -744,7 +758,14 @@ class ConversationSession:
         self._audio_started: bool = False          # 本轮是否已开始下发音频 (首次分片重置宽限)
         self._speaking_last_audio_ts: float = 0.0  # 最近一次下发音频分片的时刻 (播放期打断闸门)
         self._downlink_recent: list = []           # 最近下行片 (ts, rms) — barge-in v1 回声水平估计
-        self._barge_hits: int = 0                  # 播放中插话: 连续超"相对阈值"块计数
+        self._barge_hist: list = []                # 播放中插话: 最近 5 块命中标志 (5中3 确认)
+        self._probe_hist: list = []                # 中间级 (soft) 最近 5 块命中标志
+        self._barge_diag_last: float = 0.0         # 插话近临诊断日志限流时刻
+        self._soft_probe_until: float = 0.0        # 中间级追问观察窗截止时刻
+        self._tts_gate = asyncio.Event()           # 原回复 TTS 下发闸门 (probe 时暂停)
+        self._tts_gate.set()
+        self._probe_task: Optional[asyncio.Task] = None  # 追问后台任务 (避免阻塞接收循环)
+        self._fw_keepalive_ts: float = time.time()       # 固件录音计时保活: 最近一次补发 speech_started 时刻
         self._last_reply_text: str = ""            # 最近一次回复全文 (回声检测)
         self._last_reply_ts: float = 0.0           # 最近回复时间戳
         self._interrupt_hits: int = 0              # 全双工打断: 连续超 RMS 阈值块计数
@@ -818,27 +839,80 @@ class ConversationSession:
           固件端通过 input_audio_buffer.append 发送音频分片。
           此处同时作为打断信号检测: 在 REASONING/SPEAKING 状态收到音频 = 用户打断。
         """
+        # ---- 固件录音超时保活 ----
+        # 固件 REALTIME_RECORD_TIMEOUT=30s: 自最近一次 committed/speech_started
+        # 起算, 超时即 stopRealtimeRecord → 显示 "Please touch" 退出实时模式。
+        # 长时间监听 (持续杂音/无断句提交) 会因此静默退出 — 每 20s 补发
+        # speech_started (固件仅重置录音计时, 无其他副作用; 音频块到达
+        # 即说明固件正在录音, 检查时机自洽)
+        now_ka = time.time()
+        if now_ka - self._fw_keepalive_ts > 20.0:
+            self._fw_keepalive_ts = now_ka
+            if self._protocol_session:
+                await self._protocol_session.send_json(build_speech_started())
+                self._slog.info("固件录音计时保活 → 补发 speech_started")
+
         # ---- 打断检测 (分状态处理) ----
         # SPEAKING: 全双工固件边播边听 (AEC 后音频持续上传) —
         #   宽限期外的真实用户语音 = 打断; 残余回声由 RMS 阈值
         #   + 连续块确认过滤。半双工固件此期间无上行, 不影响。
         if self.sm.is_speaking:
-            # 打断判定 (v1):
-            #   - 近期待播/在播 (距最近下发 < tail_guard_s): 用"相对下行回声"判据
-            #     (AEC 未收敛期回声 10000+, 绝对阈值不可用)
-            #   - 播完且过了尾音保护: 用原绝对阈值判据
+            # 打断判定 (v1.1 双级):
+            #   hard (综合 = barge_in_ratio×echo_factor): 直接打断;
+            #   soft (综合 = probe_ratio×echo_factor): 追问"是在跟我说什么吗?" + 暂停原 TTS 下发,
+            #     1s 观察窗内再次命中 → 正式打断; 否则恢复继续播报。
+            #   播完且过尾音保护: 原绝对阈值判据。
             ir = self._cfg.conversation.interruption
-            if ir.enabled and time.time() >= self._interrupt_grace_until:
-                since_audio = time.time() - self._speaking_last_audio_ts
+            now = time.time()
+            if ir.enabled and now >= self._interrupt_grace_until:
+                # 观察窗到期处理须在判定之前: 若置于判定后, 每次命中都会
+                # 重设 _soft_probe_until → "观察结束"分支永不可达, 原播报
+                # 被永久暂停, 追问无限循环 (实测 hits=4,5 递进且无恢复日志)
+                if self._soft_probe_until and now >= self._soft_probe_until:
+                    self._soft_probe_until = 0.0
+                    self._probe_hist.clear()
+                    if not self._tts_gate.is_set():
+                        self._tts_gate.set()
+                        self._slog.info("中间级观察结束 → 继续原播报")
+                since_audio = now - self._speaking_last_audio_ts
                 if since_audio < ir.tail_guard_s:
-                    hit = self._barge_in_activity(audio_data)
+                    hit_hard = self._barge_in_activity(audio_data, "hard")
+                    hit_soft = hit_hard or self._barge_in_activity(audio_data, "soft")
+                    in_probe = now < self._soft_probe_until
+                    if hit_hard or (in_probe and hit_soft):
+                        self._slog.info(
+                            f"SPEAKING 期间用户插话 → 打断 "
+                            f"({'hard' if hit_hard else '中间级确认'})")
+                        self._interrupt_hits = 0
+                        self._barge_hist.clear()
+                        self._probe_hist.clear()
+                        self._soft_probe_until = 0.0
+                        self._tts_gate.set()
+                        # 追问任务若在播放: 取消 (打断后追问不应继续播)
+                        if self._probe_task and not self._probe_task.done():
+                            self._probe_task.cancel()
+                        # 清固件播放环 (环内已缓冲音频立即丢弃)
+                        if self._protocol_session:
+                            await self._protocol_session.send_json(
+                                build_audio_buffer_committed())
+                        await self.handle_interrupt()
+                    elif hit_soft and not in_probe:
+                        # 中间级首次命中: 追问 + 暂停原内容 TTS, 进入观察窗。
+                        # 追问发送放后台任务: 内联 await 会阻塞音频接收循环,
+                        # 块处理节拍被拖慢至追问发送时长 (~4s/块), 判定与
+                        # 打断时机整体错位 (实测块 #320-#410 积压后一次性 flush)
+                        self._probe_hist.clear()  # 关键: 不清零则随后的命中块继续累积反复触发追问
+                        self._soft_probe_until = now + 6.0   # 兜底窗口 (任务完成后再收敛到 +1.5s)
+                        self._tts_gate.clear()
+                        self._slog.info("中间级插话 → 追问确认 (暂停原播报)")
+                        if self._probe_task is None or self._probe_task.done():
+                            self._probe_task = asyncio.create_task(self._play_probe_ask())
                 else:
                     hit = self._voice_activity(audio_data)
-                if hit:
-                    self._slog.info("SPEAKING 期间检测到用户插话 → 打断 (v1)")
-                    self._interrupt_hits = 0
-                    self._barge_hits = 0
-                    await self.handle_interrupt()
+                    if hit:
+                        self._slog.info("SPEAKING 期间检测到用户语音 → 打断")
+                        self._interrupt_hits = 0
+                        await self.handle_interrupt()
             return
 
         # REASONING: committed 后的残留音频在宽限期内忽略;
@@ -913,36 +987,76 @@ class ConversationSession:
             self._interrupt_hits = 0
         return self._interrupt_hits >= ir.speech_confirm_blocks
 
-    def _barge_in_activity(self, audio_data: bytes) -> bool:
+    def _barge_in_activity(self, audio_data: bytes, kind: str = "hard") -> bool:
         """
         播放中插话检测 (barge-in v1): 上行相对"当前下行回声水平"的判据。
 
-        背景: AEC 未收敛期扬声器回声使上行 RMS 达 10000+, 绝对阈值无法
-        区分插话; 但回声幅度随下行内容同步波动, 故用:
-          thr = down_rms × echo_factor × barge_in_ratio + barge_in_floor
-        上行显著超过该阈值并连续确认 → 插话。参数待实测标定 (日志含
-        up/down/thr 三方数值)。
+        kind="hard": 直接打断级 (综合 barge_in_ratio×echo_factor);
+        kind="soft": 中间级 (probe_ratio×echo_factor) — 先追问确认,
+                     1s 观察窗内再次命中才正式打断。
+
+        thr = down_rms × echo_factor × ratio + barge_in_floor (≥绝对阈值)
         """
         up = _pcm_rms(audio_data)
         ir = self._cfg.conversation.interruption
         now = time.time()
         down = 0.0
+        near = 0.0
+        # 回声参考取"设备当前正在播的内容": 发送比播放超前 ~0.8-2.5s
+        # (固件环形缓冲), 故取该时间窗内的下行片峰值 — 而非全局 max
+        # (全局 max 被响句峰值持续压制, 实测导致"靠近 Mic 才能触发")
         for ts, r in self._downlink_recent:
-            if now - ts <= 0.5 and r > down:
-                down = r
-        thr = max(down * ir.echo_factor * ir.barge_in_ratio + ir.barge_in_floor,
+            age = now - ts
+            if 0.8 <= age <= 2.5:
+                if r > down:
+                    down = r
+            elif age < 0.8:
+                if r > near:
+                    near = r
+        if down <= 0.0:
+            down = near        # 回退: 刚开始播/缓冲较短时用最近片
+        ratio = ir.barge_in_ratio if kind == "hard" \
+            else float(getattr(ir, "probe_ratio", ir.barge_in_ratio))
+        thr = max(down * ir.echo_factor * ratio + ir.barge_in_floor,
                   float(ir.speech_rms_threshold))
-        if up >= thr:
-            self._barge_hits += 1
-        else:
-            self._barge_hits = 0
-        if self._barge_hits >= ir.speech_confirm_blocks:
+        hit = up >= thr
+        hist = self._barge_hist if kind == "hard" else self._probe_hist
+        hist.append(bool(hit))
+        del hist[:-5]                       # 仅保留最近 5 块
+        # 确认规则: 最近 5 块中 ≥3 块命中且当前块命中。
+        # (旧"连续 3 块"要求过脆: 用户说话的音节起伏 + AEC 波动使命中
+        #  很难连续, 实测多轮打不断; 5中3 允许 1-2 块断裂)
+        need = ir.speech_confirm_blocks
+        if len(hist) >= need and sum(hist) >= need and hist[-1]:
             self._slog.info(
-                f"插话候选: up={up:.0f} down={down:.0f} thr={thr:.0f} "
-                f"hits={self._barge_hits}"
-            )
+                f"插话候选[{kind}]: up={up:.0f} down={down:.0f} thr={thr:.0f} "
+                f"hits={sum(hist)}/{len(hist)}")
             return True
+        # 近临诊断 (限流 3s): 接近阈值但未命中 — 供复测观察余量, 便于调参
+        if not hit and up >= thr * 0.7:
+            if now - self._barge_diag_last > 3.0:
+                self._barge_diag_last = now
+                self._slog.info(
+                    f"插话近临[{kind}]: up={up:.0f} down={down:.0f} thr={thr:.0f}")
         return False
+
+    async def _play_probe_ask(self) -> None:
+        """
+        后台播放中间级追问 (不阻塞音频接收循环)。
+
+        发送完成后收敛观察窗: 追问播完 + 1.5s 内再次命中 → 确认打断;
+        超时 → 恢复原播报 (由 handle_audio_chunk 的窗口到期检查执行)。
+        """
+        try:
+            if self._tts:
+                async for _c in self._tts.feed("嗯，是在跟我说什么吗？"):
+                    await self._emit_audio_chunk(_c)
+            self._soft_probe_until = time.time() + 1.5
+        except asyncio.CancelledError:
+            raise                      # 打断取消: 状态由打断路径管理
+        except Exception as e:
+            self._slog.warning(f"追问合成失败: {e}")
+            self._soft_probe_until = time.time() + 1.5
 
     async def handle_vad_end(self) -> None:
         """
@@ -971,6 +1085,14 @@ class ConversationSession:
         """
         self._cancel_event.set()
 
+        # 追问任务若在播放: 取消; 打断状态整体清零 (防跨轮残留)
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+        self._barge_hist.clear()
+        self._probe_hist.clear()
+        self._soft_probe_until = 0.0
+        self._tts_gate.set()
+
         # 终止引擎
         if self._llm:
             await self._llm.cancel()
@@ -978,6 +1100,11 @@ class ConversationSession:
             await self._tts.cancel()
         if self._stt:
             await self._stt.reset()
+
+        # 清固件播放环: 服务器停发 ≠ 停止播放 — 环内已缓冲的音频会继续
+        # 播完 (听感: "打断后播完才响应"); committed 事件触发固件清环
+        if self._protocol_session:
+            await self._protocol_session.send_json(build_audio_buffer_committed())
 
         # 保留被打断的部分回复为上下文 (不丢弃)
         kept = self.history.keep_interrupted_assistant()
@@ -1186,7 +1313,52 @@ class ConversationSession:
         intent = self.router.route(user_text)
         self.sm.context.intent = intent
 
-        if intent in ("complex", "web") and self.auth.needs_authorization(intent):
+        # ---- 联网信息助手: 免授权后台搜索 (结果异步回流, 下一轮自动播报) ----
+        if intent == "web" and self._web.enabled:
+            wq = self._web.register(user_text)
+            await self._notify_text_delta(
+                f" [Server]: 🔍 正在联网搜索: {user_text[:30]}")
+            publish_event(AdminEvent(type="web_query",
+                                     text=f"🔍 搜索中: {user_text[:40]}",
+                                     speaker="system"))
+            got = await self._web.wait_inline(wq, self._web.inline_wait_s)
+            if got and wq.summary:
+                self.history.set_web_suffix(
+                    f"[后台任务(已完成; 请基于以下结果回答)] 查询: {wq.query}\n"
+                    f"摘要: {wq.summary}")
+                self._web.mark_task_broadcast(wq)
+                self._slog.info(f"联网查询完成(内联): {wq.query[:40]}")
+            else:
+                self.history.set_web_suffix(
+                    f"[后台任务(进行中)] 正在后台搜索: {wq.query}\n"
+                    f"(严禁编造任何查询结果! 本轮只能回答类似'我还在查, 请稍等一下', "
+                    f"不得给出具体天气/数据等内容; 真实结果稍后自动播报)")
+                self._slog.info(f"联网查询转后台: {wq.query[:40]}")
+        else:
+            pending = self._web.done_pending()
+            if pending:
+                lines = ["[后台任务(请先自然播报以下查询结果)]"]
+                for t in pending:
+                    if t.status in ("failed", "expired"):
+                        lines.append(
+                            f"- 查询: {t.query}\n  (查询失败或超时; 请如实告知用户暂时查不到)")
+                        await self._notify_text_delta(
+                            f" [Server]: ⚠️ 联网搜索未成功: {t.query[:24]}")
+                    else:
+                        lines.append(f"- 查询: {t.query}\n  摘要: {t.summary}")
+                        await self._notify_text_delta(
+                            f" [Server]: ✅ 已获取搜索结果: {t.query[:24]}")
+                publish_event(AdminEvent(type="web_query",
+                                         text=f"完成 {len(pending)} 条",
+                                         speaker="system"))
+                self.history.set_web_suffix("\n".join(lines))
+                self._web.mark_pending_broadcast(pending)
+                self._slog.info(f"后台查询结果回流播报: {len(pending)} 条")
+            else:
+                # 无待播报: 仅保留"进行中"提示 (防 LLM 虚构), 否则清空
+                self.history.set_web_suffix(self._web.prompt_slot())
+
+        if intent == "complex" and self.auth.needs_authorization(intent):
             try:
                 prompt = self.auth.request_authorization(intent)
                 await self._notify_text_delta(f" [Server]: {prompt}")
@@ -1212,6 +1384,13 @@ class ConversationSession:
             # 会在接下来 1-2 秒内到达, 这些不是用户打断, 忽略之
             self._interrupt_grace_until = time.time() + 2.0
             self._audio_started = False
+            # 打断判定状态跨轮清理 (避免上一轮残余命中数影响新一轮)
+            self._barge_hist.clear()
+            self._probe_hist.clear()
+            self._soft_probe_until = 0.0
+            self._tts_gate.set()
+            if self._probe_task and not self._probe_task.done():
+                self._probe_task.cancel()
 
         # ---- LLM (兜底: 网络/认证/余额异常均不崩溃) ----
         await self.sm.to_reasoning(user_text)
@@ -1291,6 +1470,14 @@ class ConversationSession:
         _rg = self._cfg.conversation.response_guard
         if _rg.enabled:
             _recent = self.history.recent_assistant_texts(_rg.self_repeat_window)
+            # 诊断: 复读治理输入状态 (recent 为空 → 自我复读检测被跳过,
+            # 曾出现"连续多轮相同回复但无任何拦截日志"的现场)
+            if _recent:
+                _sim = max(self._guard.similarity(full_text, x) for x in _recent)
+                self._slog.info(
+                    f"复读治理检查: recent={len(_recent)}条 最高相似度={_sim:.0%}")
+            else:
+                self._slog.info("复读治理检查: 无历史助手回复 (跳过自我复读检测)")
             result = self._guard.guard(full_text, user_text, _recent)
             retries = 0
             while result.action == "retry" and retries < _rg.max_retries:
@@ -1362,6 +1549,8 @@ class ConversationSession:
                 raise EngineError("TTS 引擎未初始化", "tts")
 
             async for audio_chunk in self._tts.feed(full_text):
+                # 中间级打断观察窗: 暂停原内容下发 (观察结束恢复继续)
+                await self._tts_gate.wait()
                 if self._cancel_event.is_set():
                     await self._tts.cancel()
                     return
@@ -1422,8 +1611,8 @@ class ConversationSession:
             if len(data) >= 32:
                 self._downlink_recent.append((self._speaking_last_audio_ts,
                                               _pcm_rms(data)))
-                if len(self._downlink_recent) > 32:
-                    self._downlink_recent = self._downlink_recent[-32:]
+                if len(self._downlink_recent) > 64:
+                    self._downlink_recent = self._downlink_recent[-64:]
             b64 = base64.b64encode(data).decode("ascii")
             ps = self._protocol_session
             await ps.send_json(build_audio_delta(b64))
@@ -1458,7 +1647,8 @@ class ConversationSession:
         """根据意图解析使用哪个模型"""
         if intent == "chat":
             return self._cfg.routing.default_model
-        if intent in ("complex", "web"):
+        if intent == "complex":
+            # web 已由本地搜索+本地模型处理 (免 approve); 仅复杂任务考虑云端
             # 尝试 DeepSeek
             if not self._cfg.routing.models.get("deepseek"):
                 return self._cfg.routing.default_model
